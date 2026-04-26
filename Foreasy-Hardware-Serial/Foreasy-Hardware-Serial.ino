@@ -1,24 +1,24 @@
 // ============================================================================
-// Foreasy ESP8266 — Unified AP (Industrial + Conventional) + EEPROM persistente
-// Placa alvo: Generic ESP8266 (mesmo padrão do industrial / ESP-01/ESP-01S)
-// AP+STA + WebSocket + /config /info + EEPROM robusto + DEBUG flash/EEPROM
+// Foreasy ESP8266 — Unified AP (Industrial + Conventional) + Serial Relay Control
+// Placa alvo: Generic ESP8266 (ESP-01/ESP-01S) + AZ-Delivery Relay Shield (STC15F104W)
+// AP+STA + WebSocket + /config /info + EEPROM persistente
 //
+// RELÉ: Controlado via Serial (9600 baud) para STC15F104W (não GPIO)
 // MODO DE MÁQUINA (persistente):
 // - Convencional: WS BIN 0x01 => RELÉ ON | 0x02 => RELÉ OFF
 // - Industrial  : WS BIN 0x01 => PULSO no relé (PULSE_MS) | ignora 0x02
 //
+// RELÉ INVERT (persistente):
+// - invert=0 => Comandos normais (ON=relayOnCmd / OFF=relayOffCmd)
+// - invert=1 => Comandos invertidos (ON=relayOffCmd / OFF=relayOnCmd) — útil para NC
+//
 // MONITORAMENTO (independe do modo):
 // - WS BIN 0x03 => responde JSON: rssi, ch, heap, block, cpu, uptime, boots
-//
-// RELÉ INVERT (persistente):
-// - invert=0 => ON=HIGH OFF=LOW
-// - invert=1 => ON=LOW  OFF=HIGH
 //
 // AP: fica ativo por 10 minutos após boot, depois desliga (lean mode)
 // Logs detalhados só enquanto AP está ativo.
 //
 // SEM restart automático nos watchdogs — apenas reconexão WiFi/WS
-// para evitar acionamento indesejado do relé no boot (GPIO0).
 // O único ESP.restart() que permanece é no /save (intencional pelo usuário).
 //
 // DICA ESP-01/ESP-01S: Flash Mode = DOUT (quando houver commit falhando)
@@ -170,8 +170,6 @@ static void updateRelayLevels() {
 }
 
 static void applyRelayPhysical(bool on) {
-  // Envia comando via Serial para o STC15F104W (sem flush — não bloqueia callbacks)
-  // relayInvert troca o sentido dos comandos (ex: NC em vez de NO)
   bool physical = relayInvert ? !on : on;
   if (physical) {
     Serial.write(relayOnCmd, 4);
