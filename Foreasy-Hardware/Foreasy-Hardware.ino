@@ -99,6 +99,10 @@ static const uint32_t GLOBAL_DOWN_RESET_MS = 8UL * 60UL * 1000UL;
 // LED only-on-change
 static bool lastLedState = false;
 
+// WS auto-restart
+static uint32_t wsLastOkMs = 0;
+static const uint32_t WS_RESTART_TIMEOUT_MS = 60UL * 60UL * 1000UL; // 1 hora
+
 // ======================== RELAY MODE =========================
 enum MachineMode : uint8_t {
   MODE_CONVENTIONAL = 0,
@@ -129,7 +133,7 @@ static char logBuffer[LOG_MAX_LEN + 1];
 // ======================== EEPROM =========================
 #define EEPROM_SIZE 512
 static const uint32_t EEPROM_MAGIC = 0xF0EA5E01;
-static const uint16_t EEPROM_VER   = 3; // v3: ssid2/pass2 (dual WiFi failover)
+static const uint16_t EEPROM_VER   = 4; // v4: wsRestartEnabled (auto-restart sem WS)
 
 struct __attribute__((packed)) Persist {
   uint32_t magic;
@@ -147,7 +151,8 @@ struct __attribute__((packed)) Persist {
   uint32_t bootCount;     // incrementa em RAM no boot (não commit automático)
   uint8_t  lastResetReason;
 
-  uint8_t  reserved[6];
+  uint8_t  wsRestartEnabled; // 0=off, 1=reinicia após 1h sem WS
+  uint8_t  reserved[5];
 };
 
 Persist P;
@@ -384,7 +389,15 @@ static void persistLoad() {
 
   if (DEBUG_EEPROM_DUMP) debugEepromDump(0, 64);
 
-  if (P.magic != EEPROM_MAGIC || P.ver != EEPROM_VER) {
+  if (P.magic == EEPROM_MAGIC && P.ver == 3) {
+    Serial.println("[EEPROM] v3->v4 migration: preservando config, wsRestartEnabled=0");
+    P.ver = EEPROM_VER;
+    P.wsRestartEnabled = 0;
+    memset(P.reserved, 0, sizeof(P.reserved));
+    EEPROM.put(0, P);
+    bool ok = EEPROM.commit();
+    Serial.printf("[EEPROM] migration commit=%s\n", ok ? "true" : "false");
+  } else if (P.magic != EEPROM_MAGIC || P.ver != EEPROM_VER) {
     Serial.println("[EEPROM] mismatch -> defaults");
     persistDefaults();
     EEPROM.put(0, P);
@@ -519,6 +532,7 @@ static void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
     case WStype_CONNECTED: {
       isWebSocketConnected = true;
       lastPingMs = millis();
+      wsLastOkMs = millis();
       wsDownSinceMs = 0;
       resetWsBackoff();
 
@@ -707,6 +721,11 @@ a{color:#198754}
     <label for="invert">Inverter lógica do relé (ON=LOW / OFF=HIGH)</label>
   </div>
 
+  <div class="chkRow">
+    <input id="wsrestart" type="checkbox">
+    <label for="wsrestart">Reiniciar automaticamente se sem conexão por 1 hora</label>
+  </div>
+
   <button id="save" style="margin-top:18px">Salvar e Reiniciar</button>
   <small id="status"></small>
 
@@ -749,6 +768,17 @@ function scan(){
 }
 
 window.onload=()=>{
+  fetch('/config-data').then(r=>r.json()).then(d=>{
+    qs('manual_ssid').value = d.ssid   || '';
+    qs('pass').value        = d.pass   || '';
+    qs('ssid2').value       = d.ssid2  || '';
+    qs('pass2').value       = d.pass2  || '';
+    qs('nodeid').value      = d.nodeid || '';
+    setMode(d.mode || 1);
+    qs('invert').checked    = (d.invert    === 1);
+    qs('wsrestart').checked = (d.wsrestart === 1);
+  }).catch(()=>{});
+
   scan();
 
   qs('btnConv').onclick=()=>setMode(0);
@@ -761,6 +791,7 @@ window.onload=()=>{
     let pw2=qs('pass2').value;
     let id=qs('nodeid').value.trim();
     let inv = qs('invert').checked ? '1' : '0';
+    let wsr = qs('wsrestart').checked ? '1' : '0';
 
     if(!ss){ qs('status').textContent='Preencha o SSID da rede 1!'; return; }
     if(!id){ qs('status').textContent='Preencha o NodeID!'; return; }
@@ -777,7 +808,8 @@ window.onload=()=>{
         '&pass2='+encodeURIComponent(pw2)+
         '&nodeid='+encodeURIComponent(id)+
         '&mode='+encodeURIComponent(String(machineMode))+
-        '&invert='+encodeURIComponent(inv)
+        '&invert='+encodeURIComponent(inv)+
+        '&wsrestart='+encodeURIComponent(wsr)
     }).then(r=>r.text()).then(t=>{
       qs('status').textContent=t;
     }).catch(()=>{
@@ -790,6 +822,24 @@ window.onload=()=>{
 )rawliteral";
 
 // ======================== HTTP handlers =========================
+static void handleConfigData() {
+  char ssEsc[70], pwEsc[134], ss2Esc[70], pw2Esc[134], nidEsc[52];
+  json_escape_into(P.ssid,   ssEsc,  sizeof(ssEsc));
+  json_escape_into(P.pass,   pwEsc,  sizeof(pwEsc));
+  json_escape_into(P.ssid2,  ss2Esc, sizeof(ss2Esc));
+  json_escape_into(P.pass2,  pw2Esc, sizeof(pw2Esc));
+  json_escape_into(P.nodeId, nidEsc, sizeof(nidEsc));
+
+  char buf[540];
+  snprintf(buf, sizeof(buf),
+    "{\"ssid\":\"%s\",\"pass\":\"%s\",\"ssid2\":\"%s\",\"pass2\":\"%s\","
+    "\"nodeid\":\"%s\",\"mode\":%u,\"invert\":%u,\"wsrestart\":%u}",
+    ssEsc, pwEsc, ss2Esc, pw2Esc, nidEsc,
+    (unsigned)P.machineMode, (unsigned)P.relayInvert, (unsigned)P.wsRestartEnabled
+  );
+  server.send(200, "application/json", buf);
+}
+
 static void handleRoot() {
   server.sendHeader("Location", "/config", true);
   server.send(302, "text/plain", "");
@@ -1013,6 +1063,7 @@ static void handleSave() {
 
   uint8_t mode = (server.hasArg("mode") ? (uint8_t)server.arg("mode").toInt() : 1);
   uint8_t inv  = (server.hasArg("invert") ? (uint8_t)server.arg("invert").toInt() : 0);
+  uint8_t wsr  = (server.hasArg("wsrestart") ? (uint8_t)server.arg("wsrestart").toInt() : 0);
 
   memset(P.ssid,  0, sizeof(P.ssid));
   memset(P.pass,  0, sizeof(P.pass));
@@ -1029,8 +1080,9 @@ static void handleSave() {
   P.magic = EEPROM_MAGIC;
   P.ver   = EEPROM_VER;
 
-  P.machineMode = (mode == 0) ? 0 : 1;
-  P.relayInvert = (inv  == 0) ? 0 : 1;
+  P.machineMode      = (mode == 0) ? 0 : 1;
+  P.relayInvert      = (inv  == 0) ? 0 : 1;
+  P.wsRestartEnabled = (wsr  == 0) ? 0 : 1;
 
   wifiSlot = 0; // sempre começa pela rede 1 após salvar
 
@@ -1075,6 +1127,7 @@ static void handleNotFound() { server.send(404, "text/plain", "Not found"); }
 static void startWebServer() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/config", HTTP_GET, handleConfigPage);
+  server.on("/config-data", HTTP_GET, handleConfigData);
   server.on("/info", HTTP_GET, handleInfoPage);
   server.on("/scan", HTTP_GET, handleScan);
   server.on("/save", HTTP_POST, handleSave);
@@ -1201,6 +1254,16 @@ static void apLifetimeTick() {
   }
 }
 
+static void wsRestartTick() {
+  if (!P.wsRestartEnabled) return;
+  if (isWebSocketConnected) { wsLastOkMs = millis(); return; }
+  if ((millis() - wsLastOkMs) > WS_RESTART_TIMEOUT_MS) {
+    logf("WS_RESTART: sem WS por 1h. Reiniciando.");
+    delay(200);
+    ESP.restart();
+  }
+}
+
 // ======================== SETUP / LOOP =========================
 void setup() {
   Serial.begin(115200);
@@ -1252,6 +1315,7 @@ void setup() {
   log_append_line("HTTP server iniciado.");
 
   lastConnectivityOkMs = millis();
+  wsLastOkMs = millis();
   resetWsBackoff();
 
   if (hasSavedWiFi()) connectToWiFi_begin();
@@ -1269,4 +1333,5 @@ void loop() {
   updateLedTick();
   watchdogTick();
   apLifetimeTick();
+  wsRestartTick();
 }
