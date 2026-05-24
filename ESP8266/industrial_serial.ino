@@ -1,27 +1,55 @@
 // ============================================================================
-// Foreasy ESP8266 — Unified AP (Industrial + Conventional) + EEPROM persistente
-// Placa alvo: Generic ESP8266 (mesmo padrão do industrial / ESP-01/ESP-01S)
-// AP+STA + WebSocket + /config /info + EEPROM robusto + DEBUG flash/EEPROM
+// Foreasy ESP8266 — Modelos 1 e 5
+// Hardware Modelo 1: ESP8266 ESP-01S + shield relay serial AZ-Delivery (STC15F104W)
+// Hardware Modelo 5: ESP8266 ESP-01S + shield relay serial + SSR externo de alta corrente
+//   (o relay do shield aciona o SSR, que controla a carga da máquina)
 //
-// MODO DE MÁQUINA (persistente):
-// - Convencional: WS BIN 0x01 => RELÉ ON | 0x02 => RELÉ OFF
-// - Industrial  : WS BIN 0x01 => PULSO no relé (PULSE_MS) | ignora 0x02
+// SISTEMA: Industrial ou Convencional — selecionado por machineMode na EEPROM
+//
+// MODO INDUSTRIAL (machineMode = 1) — padrão de fábrica:
+//   WS 0x01 => PULSO: relay fecha por PULSE_MS (100ms) depois abre automaticamente
+//   WS 0x02 => ignorado
+//   Usado para máquinas que aceitam um pulso elétrico para liberar um ciclo.
+//
+// MODO CONVENCIONAL (machineMode = 0):
+//   WS 0x01 => RELAY ON  (fica ligado até receber OFF)
+//   WS 0x02 => RELAY OFF
+//   Controle direto de energia — relay permanece no estado até novo comando.
+//
+// RELAY INVERT (relayInvert) — útil para relay NF (Normalmente Fechado):
+//   0 => normal   (ON = envia relayOnCmd  | OFF = envia relayOffCmd)
+//   1 => invertido (ON = envia relayOffCmd | OFF = envia relayOnCmd)
+//
+// RELAY: controlado via Serial 9600 baud → MCU STC15F104W (não via GPIO direto)
+//   ON  = bytes {0xA0, 0x01, 0x01, 0xA2}
+//   OFF = bytes {0xA0, 0x01, 0x00, 0xA1}
+//   Serial EXCLUSIVA do relay — sem debug por Serial após boot.
+//   Logs disponíveis apenas em HTTP /info enquanto o AP estiver ativo (10 min).
 //
 // MONITORAMENTO (independe do modo):
-// - WS BIN 0x03 => responde JSON: rssi, ch, heap, block, cpu, uptime, boots
+//   WS 0x03 => responde JSON: rssi, ch, heap, block, cpu, uptime, boots, wifiSlot
 //
-// RELÉ INVERT (persistente):
-// - invert=0 => ON=HIGH OFF=LOW
-// - invert=1 => ON=LOW  OFF=HIGH
+// WIFI:
+//   Dual WiFi: failover automático entre rede 1 e rede 2 sem restart.
+//   Conexão não-bloqueante (wifiTick). Credenciais nunca apagadas por falha.
+//   Scan WiFi assíncrono para não bloquear o loop.
 //
-// AP: fica ativo por 10 minutos após boot, depois desliga (lean mode)
-// Logs detalhados só enquanto AP está ativo.
+// WEBSOCKET:
+//   Backoff exponencial 10s → 120s.
+//   Watchdog WS  : sem WS >5min  → failover WiFi+WS.
+//   Watchdog geral: sem WiFi+WS >8min → failover.
+//   wsRestartEnabled: reinicia o ESP após 1h sem WS (configurável via /config).
 //
-// SEM restart automático nos watchdogs — apenas reconexão WiFi/WS
-// para evitar acionamento indesejado do relé no boot (GPIO0).
-// O único ESP.restart() que permanece é no /save (intencional pelo usuário).
+// AP: ativo 10 min após boot — SSID: <nodeId>-AP | Senha: 12345678
+//     Após expirar: AP desliga, logs do buffer são apagados (lean mode).
 //
-// DICA ESP-01/ESP-01S: Flash Mode = DOUT (quando houver commit falhando)
+// EEPROM v4 (magic 0xF0EA5E01):
+//   ssid[32], pass[64], ssid2[32], pass2[64], nodeId[24],
+//   machineMode, relayInvert, bootCount, lastResetReason, wsRestartEnabled.
+//   Apaga setor antes de salvar + até 3 tentativas de commit com verificação.
+//   bootCount incrementado em RAM; não salvo automaticamente a cada boot.
+//
+// DICA: se EEPROM.commit() falhar → selecionar Flash Mode = DOUT na IDE Arduino
 // ============================================================================
 
 #include <ESP8266WiFi.h>
@@ -32,9 +60,10 @@
 
 
 // ======================== CONFIG DEBUG =========================
-static const bool DEBUG_FLASH_INFO        = true;
-static const bool DEBUG_EEPROM_DUMP       = true;
-static const bool DEBUG_EEPROM_SECTORINFO = true;
+// DESATIVADO: Serial é exclusiva do relé (STC15F104W). Prints corrompem comandos.
+static const bool DEBUG_FLASH_INFO        = false;
+static const bool DEBUG_EEPROM_DUMP       = false;
+static const bool DEBUG_EEPROM_SECTORINFO = false;
 
 // ATENÇÃO: /save pode apagar setor antes de gravar. Útil para diagnóstico.
 // Se quiser mais conservador depois, mude para false.
@@ -48,12 +77,17 @@ static const char*    WS_HOST = "frst-back-02b607761078.herokuapp.com";
 static const uint16_t WS_PORT = 80;
 
 // ======================== IO (ESP-01/ESP-01S / Generic ESP8266) =========================
-static const int  relayPin = 0;  // GPIO0
+// NOTA: Relé controlado via Serial (STC15F104W), não via GPIO
 static const int  ledPin   = 2;  // GPIO2 (LED onboard costuma ser ativo LOW)
 static const bool LED_ACTIVE_LOW = true;
 
 // Pulso industrial
 static const uint16_t PULSE_MS = 100;
+
+// ======================== Comandos Serial para Relé =========================
+// Envia via Serial 9600 baud para o STC15F104W
+static uint8_t relayOnCmd[]  = {0xA0, 0x01, 0x01, 0xA2};  // Relé ON
+static uint8_t relayOffCmd[] = {0xA0, 0x01, 0x00, 0xA1};  // Relé OFF
 
 // ======================== AP =========================
 static IPAddress apIP(192, 168, 4, 1);
@@ -169,7 +203,12 @@ static void updateRelayLevels() {
 }
 
 static void applyRelayPhysical(bool on) {
-  digitalWrite(relayPin, on ? relayOnLevel : relayOffLevel);
+  bool physical = relayInvert ? !on : on;
+  if (physical) {
+    Serial.write(relayOnCmd, 4);
+  } else {
+    Serial.write(relayOffCmd, 4);
+  }
 }
 
 static void relayOffSafe() {
@@ -180,11 +219,7 @@ static void relayOffSafe() {
 
 // ======================== Helpers (Log) =========================
 static void log_append_line(const char* line) {
-  if (!apEnabled) {
-    Serial.print("[CRIT] ");
-    Serial.println(line);
-    return;
-  }
+  if (!apEnabled) return;  // Serial é do relé — sem fallback após AP desligar
 
   char tmp[300];
   unsigned long secs = millis() / 1000UL;
@@ -204,8 +239,7 @@ static void log_append_line(const char* line) {
 
   memcpy(logBuffer + cur, tmp, add);
   logBuffer[cur + add] = '\0';
-
-  Serial.print(tmp);
+  // Serial.print removido — Serial é exclusiva do relé (STC15F104W)
 }
 
 static void logf(const char* fmt, ...) {
@@ -347,15 +381,8 @@ static void debugEepromDump(uint16_t from = 0, uint16_t len = 64) {
 
 static bool diagEraseEepromSector() {
   uint32_t ideSz  = ESP.getFlashChipSize();
-  uint32_t realSz = ESP.getFlashChipRealSize();
   uint32_t sector = eepromSectorIndexFromFlashSize(ideSz);
-
-  Serial.println("[DIAG] Attempting flashEraseSector(last sector used for EEPROM)...");
-  Serial.printf("[DIAG] Flash Real=%u IDE=%u | sector=%lu\n",
-                realSz, ideSz, (unsigned long)sector);
-
   bool ok = ESP.flashEraseSector(sector);
-  Serial.printf("[DIAG] flashEraseSector result=%s\n", ok ? "true" : "false");
   return ok;
 }
 
@@ -383,43 +410,31 @@ static void applyPersistRuntime() {
 static void persistLoad() {
   EEPROM.get(0, P);
 
-  Serial.printf("[EEPROM] boot read: magic=0x%08lX ver=%u ssid='%s' node='%s' mode=%u invert=%u\n",
-                (unsigned long)P.magic, (unsigned)P.ver, P.ssid, P.nodeId,
-                (unsigned)P.machineMode, (unsigned)P.relayInvert);
-
   if (DEBUG_EEPROM_DUMP) debugEepromDump(0, 64);
 
   if (P.magic == EEPROM_MAGIC && P.ver == 3) {
-    Serial.println("[EEPROM] v3->v4 migration: preservando config, wsRestartEnabled=0");
+    // Migração v3 -> v4: preserva config, adiciona wsRestartEnabled=0
     P.ver = EEPROM_VER;
     P.wsRestartEnabled = 0;
     memset(P.reserved, 0, sizeof(P.reserved));
     EEPROM.put(0, P);
-    bool ok = EEPROM.commit();
-    Serial.printf("[EEPROM] migration commit=%s\n", ok ? "true" : "false");
+    EEPROM.commit();
   } else if (P.magic != EEPROM_MAGIC || P.ver != EEPROM_VER) {
-    Serial.println("[EEPROM] mismatch -> defaults");
     persistDefaults();
     EEPROM.put(0, P);
-    bool ok = EEPROM.commit();
-    Serial.printf("[EEPROM] defaults commit=%s\n", ok ? "true" : "false");
+    EEPROM.commit();
   }
 
   applyPersistRuntime();
 }
 
 static bool persistSaveAndVerifyOnce(uint8_t tryN) {
+  (void)tryN;
   EEPROM.put(0, P);
   bool ok = EEPROM.commit();
 
   Persist T;
   EEPROM.get(0, T);
-
-  Serial.printf("[EEPROM] try=%u save: commit=%s magic=0x%08lX ver=%u ssid='%s' node='%s' mode=%u invert=%u\n",
-                (unsigned)tryN,
-                ok ? "true" : "false",
-                (unsigned long)T.magic, (unsigned)T.ver, T.ssid, T.nodeId,
-                (unsigned)T.machineMode, (unsigned)T.relayInvert);
 
   if (DEBUG_EEPROM_DUMP) debugEepromDump(0, 64);
 
@@ -453,7 +468,7 @@ static void bumpWsBackoff()  { if (wsRetryStreak < 10) wsRetryStreak++; wsNextRe
 
 // ======================== Reconexão completa WiFi+WS (sem restart) =========================
 static void fullReconnectWiFiWS() {
-  Serial.println("[RECOVERY] Reconexão completa WiFi+WS (sem restart).");
+  logf("RECOVERY: Reconexao completa WiFi+WS.");
   webSocket.disconnect();
   isWebSocketConnected = false;
   delay(50);
@@ -472,7 +487,7 @@ static void fullReconnectWiFiWS() {
 
 static void switchWiFiSlot() {
   wifiSlot = (wifiSlot == 0) ? 1 : 0;
-  Serial.printf("[FAILOVER] Alternando para rede %u: SSID=%s\n", wifiSlot + 1, activeSSID());
+  logf("FAILOVER: Alternando para rede %u: SSID=%s", wifiSlot + 1, activeSSID());
   webSocket.disconnect();
   isWebSocketConnected = false;
   delay(50);
@@ -754,17 +769,19 @@ function setMode(m){
   qs('btnInd').classList.toggle('active', m===1);
 }
 
-function scan(){
+function scan(retries){
+  retries=retries||0;
   fetch('/scan').then(r=>r.json()).then(list=>{
     let s=qs('ssid');
+    if(list.length===0&&retries<5){setTimeout(()=>scan(retries+1),3000);return;}
     s.innerHTML='';
     list.forEach(i=>{
       let o=document.createElement('option');
       o.value=i.ssid;
-      o.textContent = i.ssid + ' | ' + i.rssi + ' dBm | CH ' + i.channel + ' | ' + encText(i.enc);
+      o.textContent=i.ssid+' | '+i.rssi+' dBm | CH '+i.channel+' | '+encText(i.enc);
       s.appendChild(o);
     });
-  }).catch(()=>{});
+  }).catch(()=>{if(retries<5)setTimeout(()=>scan(retries+1),3000);});
 }
 
 window.onload=()=>{
@@ -852,10 +869,23 @@ static void handleConfigPage() {
 static void handleScan() {
   if (!apEnabled) { server.send(200, "application/json", "[]"); return; }
 
-  log_append_line("Scan WiFi (/scan) iniciado...");
-  int n = WiFi.scanNetworks();
-  logf("Scan (/scan) concluído. n=%d", n);
+  int8_t n = WiFi.scanComplete();
 
+  if (n == WIFI_SCAN_RUNNING) {
+    // Scan ainda em andamento — retorna vazio, frontend tenta de novo
+    server.send(200, "application/json", "[]");
+    return;
+  }
+
+  if (n == WIFI_SCAN_FAILED || n < 0) {
+    // Inicia scan assíncrono (não bloqueia o loop)
+    WiFi.scanNetworks(true);
+    log_append_line("Scan WiFi iniciado (async).");
+    server.send(200, "application/json", "[]");
+    return;
+  }
+
+  // Scan concluído — monta JSON com os resultados
   const int MAXN = 25;
   int outN = (n > MAXN) ? MAXN : n;
 
@@ -866,9 +896,10 @@ static void handleScan() {
   for (int i = 0; i < outN; i++) {
     if (i > 0) server.sendContent(",");
 
-    String ssidS = WiFi.SSID(i);
+    char ssidRaw[33] = {0};
+    WiFi.SSID(i).toCharArray(ssidRaw, sizeof(ssidRaw));
     char ssEsc[160];
-    json_escape_into(ssidS.c_str(), ssEsc, sizeof(ssEsc));
+    json_escape_into(ssidRaw, ssEsc, sizeof(ssEsc));
 
     char obj[240];
     snprintf(obj, sizeof(obj),
@@ -951,12 +982,17 @@ static void handleInfoPage() {
   const size_t SHOW_MAX = 1400;
   if (logLen > SHOW_MAX) logStart = srcLog + (logLen - SHOW_MAX);
 
+  // Buffer local evita String temporária de WiFi.SSID() na heap
+  char currentSSID[33] = {0};
+  if (staOk) WiFi.SSID().toCharArray(currentSSID, sizeof(currentSSID));
+
   static char logEsc[2200];
   static char page[6800];
   html_escape_into(logStart, logEsc, sizeof(logEsc));
 
-  // Status do relé (físico) e lógico
-  const char* relayPhys = (digitalRead(relayPin) == relayOnLevel) ? "ON-level" : "OFF-level";
+  // Status do relé (via Serial)
+  bool physOn = relayInvert ? !relayLogicalOn : relayLogicalOn;
+  const char* relayPhys = physOn ? "ON" : "OFF";
   const char* relayLogic = relayLogicalOn ? "ON" : "OFF";
 
   int n = snprintf(
@@ -1014,7 +1050,7 @@ static void handleInfoPage() {
     "</div>",
     (P.nodeId[0] ? P.nodeId : "—"),
     wifiSavedBuf,
-    (staOk ? WiFi.SSID().c_str() : "—"),
+    (staOk ? currentSSID : "—"),
     rssiBuf,
     ipsta,
     ipap,
@@ -1100,23 +1136,20 @@ static void handleSave() {
   delay(120);
   yield();
 
-  Serial.println("[EEPROM] save requested");
   if (DEBUG_EEPROM_SECTORINFO) debugEepromSectorInfo();
 
   if (ERASE_SECTOR_BEFORE_SAVE) {
-    bool eok = diagEraseEepromSector();
-    Serial.printf("[EEPROM] eraseBeforeSave=%s\n", eok ? "true" : "false");
+    diagEraseEepromSector();
     delay(50);
     yield();
   }
 
-  bool ok = persistSaveAndVerifyRetry(COMMIT_TRIES);
+  persistSaveAndVerifyRetry(COMMIT_TRIES);
 
   EEPROM.end();
   delay(250);
   yield();
 
-  Serial.printf("[EEPROM] save ok=%s\n", ok ? "true" : "false");
   delay(200);
 
   ESP.restart();
@@ -1224,7 +1257,7 @@ static void watchdogTick() {
     if (wifiOk && !wsOk) {
       if (wsDownSinceMs == 0) wsDownSinceMs = millis();
       if ((millis() - wsDownSinceMs) > WS_DOWN_RESET_MS) {
-        Serial.println("[CRIT] WATCHDOG: WS down > 5min. Failover/reconexão WiFi+WS.");
+        logf("WATCHDOG: WS down > 5min. Failover.");
         failoverReconnect();
       }
     } else {
@@ -1234,8 +1267,8 @@ static void watchdogTick() {
     // Sem WiFi e sem WS por mais de 8 min => reconexão completa (sem restart)
     if (!wifiOk && !wsOk) {
       if ((millis() - lastConnectivityOkMs) > GLOBAL_DOWN_RESET_MS) {
-        Serial.println("[CRIT] GLOBAL WD: sem WiFi e sem WS por muito tempo. Failover/reconexão.");
-        lastConnectivityOkMs = millis(); // reseta o timer para não disparar em loop
+        logf("GLOBAL WD: sem WiFi e WS por muito tempo. Failover.");
+        lastConnectivityOkMs = millis();
         failoverReconnect();
       }
     }
@@ -1266,25 +1299,19 @@ static void wsRestartTick() {
 
 // ======================== SETUP / LOOP =========================
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);  // IMPORTANTE: 9600 baud para comunicar com STC15F104W
   delay(60);
 
   debugFlashInfoOnce();
 
   pinMode(ledPin, OUTPUT);
-  pinMode(relayPin, OUTPUT);
-  digitalWrite(0, LOW); // mantém relé desligado (se for ativo LOW)
+  // Relé controlado via Serial, não precisa pinMode
 
   setLed(false);
   lastLedState = false;
 
-  // default relay levels
-  //updateRelayLevels();
-  relayOffSafe();
-
   logBuffer[0] = '\0';
 
-  Serial.println("[EEPROM] begin (setup)");
   EEPROM.begin(EEPROM_SIZE);
   if (DEBUG_EEPROM_SECTORINFO) debugEepromSectorInfo();
 
