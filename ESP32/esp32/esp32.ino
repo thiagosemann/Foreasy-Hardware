@@ -14,7 +14,7 @@
 // PROTOCOLO WEBSOCKET (binário):
 // - 0x01 => Relay ON  (ignorado se relayMode != 0)
 // - 0x02 => Relay OFF (ignorado se relayMode != 0)
-// - 0x03 => Responde JSON com rssi, heap, uptime, boots, wifiSlot, temp
+// - 0x03 => Responde JSON com rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, temp
 //
 // WIFI:
 // - Dual WiFi com failover automático entre rede 1 e rede 2 (sem restart)
@@ -271,11 +271,14 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 
         if (b == 0x03) {
           bool staOk = (WiFi.status() == WL_CONNECTED);
-          char buf[200];
+          char buf[260];
           snprintf(buf, sizeof(buf),
-            "{\"rssi\":%d,\"heap\":%u,\"uptime\":%lu,\"boots\":%lu,\"wifiSlot\":%u,\"temp\":%.1f}",
+            "{\"rssi\":%d,\"ch\":%d,\"heap\":%u,\"block\":%u,\"cpu\":%u,\"uptime\":%lu,\"boots\":%lu,\"wifiSlot\":%u,\"temp\":%.1f}",
             staOk ? WiFi.RSSI() : 0,
+            staOk ? (int)WiFi.channel() : 0,
             (unsigned)ESP.getFreeHeap(),
+            (unsigned)ESP.getMaxAllocHeap(),
+            (unsigned)ESP.getCpuFreqMHz(),
             (unsigned long)(millis() / 1000UL),
             (unsigned long)bootCount,
             (unsigned)wifiSlot,
@@ -440,6 +443,7 @@ void apLifetimeTick() {
 void wsRestartTick() {
   if (!wsRestartEnabled) return;
   if (isWebSocketConnected) { wsLastOkMs = millis(); return; }
+  if (isRelayEffectiveOn())  { wsLastOkMs = millis(); return; }  // não reinicia com relé ativo
   if ((millis() - wsLastOkMs) > WS_RESTART_TIMEOUT_MS) {
     Serial.println("WS_RESTART: sem WS por 1h. Reiniciando.");
     delay(200);
@@ -472,28 +476,43 @@ void startWebServer() {
 // ========== / ==========
 void handleRoot() {
   String html = R"rawliteral(
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Foreasy</title>
 <style>
-body{background:#eef6f0;font-family:Arial;margin:0;color:#222;text-align:center}
-.header{background:#198754;color:white;padding:22px;font-size:24px;font-weight:bold}
-.container{margin-top:28px}
-.btn{display:block;margin:12px auto;padding:14px 18px;width:85%;max-width:360px;background:#198754;color:white;font-size:18px;border-radius:12px;text-decoration:none;box-shadow:0 4px 12px rgba(0,0,0,0.12)}
-.btn:hover{background:#146b45}
-.small{color:#666;margin-top:18px}
+:root{--bg:#0a0e0b;--cd:#111814;--bd:#1e3028;--ac:#00e676;--ac2:#009e55;--tx:#d4f5e0;--mu:#557060}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font-family:ui-monospace,'Cascadia Code','SF Mono',monospace;min-height:100vh}
+header{background:var(--cd);border-bottom:1px solid var(--bd);padding:22px;text-align:center}
+.logo{color:var(--ac);font-size:24px;font-weight:700;letter-spacing:4px}
+.sub{color:var(--mu);font-size:11px;letter-spacing:2px;margin-top:5px}
+main{max-width:420px;margin:0 auto;padding:28px 16px}
+.menu{display:grid;gap:8px}
+.lnk{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;background:var(--cd);border:1px solid var(--bd);border-radius:3px;color:var(--tx);text-decoration:none;font-size:13px;transition:border-color .15s}
+.lnk:hover{border-color:var(--ac);color:var(--ac)}
+.lnk:hover .arr{color:var(--ac)}
+.lnk .desc{font-size:10px;color:var(--mu);margin-top:2px;transition:color .15s}
+.lnk:hover .desc{color:var(--ac2)}
+.arr{color:var(--mu);font-size:16px;transition:color .15s}
+footer{text-align:center;margin-top:28px;color:var(--mu);font-size:10px;letter-spacing:1px;padding-bottom:20px}
 </style></head><body>
-<div class="header">Foreasy - Dispositivo</div>
-<div class="container">
-  <a class="btn" href="/config">Configurar Wi-Fi</a>
-  <a class="btn" href="/nodeid">Configurar NodeID</a>
-  <a class="btn" href="/info">Informações</a>
-  <a class="btn" href="/relay">Controle do Relé</a>
-  <a class="btn" href="/wifistatus">Status Wi-Fi</a>
-  <a class="btn" href="/wsstatus">Status WebSocket</a>
-  <a class="btn" href="/resetwifi">Reset credenciais</a>
-  <a class="btn" href="/restart">Reiniciar</a>
-</div>
-<div class="small">Foreasy Smart Devices</div>
+<header>
+  <div class="logo">FOREASY</div>
+  <div class="sub">smart device · esp32</div>
+</header>
+<main>
+  <div class="menu">
+    <a class="lnk" href="/config"><div><div>Configurar Wi-Fi</div><div class="desc">redes e credenciais</div></div><span class="arr">→</span></a>
+    <a class="lnk" href="/nodeid"><div><div>Node ID</div><div class="desc">identificação do dispositivo</div></div><span class="arr">→</span></a>
+    <a class="lnk" href="/info"><div><div>Informações</div><div class="desc">status em tempo real</div></div><span class="arr">→</span></a>
+    <a class="lnk" href="/relay"><div><div>Controle do Relé</div><div class="desc">modo e tipo</div></div><span class="arr">→</span></a>
+    <a class="lnk" href="/wifistatus"><div><div>Status Wi-Fi</div><div class="desc">conexão e sinal</div></div><span class="arr">→</span></a>
+    <a class="lnk" href="/wsstatus"><div><div>Status WebSocket</div><div class="desc">servidor e backoff</div></div><span class="arr">→</span></a>
+    <a class="lnk" href="/resetwifi"><div><div>Reset Credenciais</div><div class="desc">apaga Wi-Fi e reinicia</div></div><span class="arr">→</span></a>
+    <a class="lnk" href="/restart"><div><div>Reiniciar</div><div class="desc">reinicia o ESP32</div></div><span class="arr">→</span></a>
+  </div>
+</main>
+<footer>foreasy smart devices</footer>
 </body></html>
 )rawliteral";
   server.send(200, "text/html", html);
@@ -502,67 +521,85 @@ body{background:#eef6f0;font-family:Arial;margin:0;color:#222;text-align:center}
 // ========== /config ==========
 void handleConfigPage() {
   String html = R"rawliteral(
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Foreasy - Configuração</title>
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Foreasy — Config</title>
 <style>
-body{background:#eef6f0;font-family:Arial;margin:0;color:#222}
-.header{background:#198754;color:#fff;padding:20px;text-align:center;font-weight:700}
-.card{background:#fff;max-width:520px;margin:18px auto;padding:18px;border-radius:12px;box-shadow:0 6px 18px rgba(0,0,0,0.12)}
-input,select,button{width:100%;padding:12px;margin-top:10px;border-radius:8px;border:1px solid #cfe9d8;box-sizing:border-box}
-button{background:#198754;color:#fff;border:none;font-weight:700;cursor:pointer}
-small{color:#444;display:block;margin-top:10px;line-height:1.35}
-a{color:#198754}
-.section{font-weight:700;color:#198754;margin-top:18px;margin-bottom:4px;border-bottom:1px solid #cfe9d8;padding-bottom:4px}
-.toggleRow{display:flex;gap:10px;margin-top:10px}
-.toggleBtn{flex:1;border:1px solid #cfe9d8;border-radius:10px;padding:10px;cursor:pointer;background:#f7fff7;text-align:center;font-size:14px}
-.toggleBtn.active{outline:2px solid #198754;border-color:#198754;font-weight:700}
-.chkRow{display:flex;align-items:center;gap:10px;margin-top:12px}
-.chkRow input{width:auto;margin:0}
+:root{--bg:#0a0e0b;--cd:#111814;--bd:#1e3028;--ac:#00e676;--ac2:#009e55;--tx:#d4f5e0;--mu:#557060;--lb:#4ade80;--ip:#0d1710}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font-family:ui-monospace,'Cascadia Code','SF Mono',monospace;font-size:13px}
+header{background:var(--cd);border-bottom:1px solid var(--bd);padding:14px 20px}
+.logo{color:var(--ac);font-size:18px;font-weight:700;letter-spacing:3px}
+.sub{color:var(--mu);font-size:10px;letter-spacing:1px;margin-top:2px}
+main{max-width:540px;margin:0 auto;padding:18px 16px 32px}
+.sec{color:var(--lb);font-size:10px;letter-spacing:2px;text-transform:uppercase;margin:22px 0 10px;padding-bottom:5px;border-bottom:1px solid var(--bd)}
+label{color:var(--mu);font-size:10px;letter-spacing:1px;text-transform:uppercase;display:block;margin:12px 0 4px}
+input,select{width:100%;background:var(--ip);color:var(--tx);border:1px solid var(--bd);border-radius:3px;padding:10px 12px;font-family:inherit;font-size:13px;outline:none;transition:border-color .15s}
+input:focus,select:focus{border-color:var(--ac)}
+select option{background:var(--cd)}
+.trow{display:flex;gap:8px;margin-top:8px}
+.tgl{flex:1;padding:11px 8px;border:1px solid var(--bd);border-radius:3px;cursor:pointer;text-align:center;background:var(--cd);color:var(--mu);font-size:12px;transition:all .15s;line-height:1.4}
+.tgl.active{background:#003d1a;border-color:var(--ac);color:var(--ac);font-weight:700}
+.tgl small{display:block;font-size:10px;opacity:.7;margin-top:2px}
+.chk{display:flex;align-items:center;gap:10px;margin-top:10px;padding:10px 12px;border:1px solid var(--bd);border-radius:3px;background:var(--cd)}
+.chk input[type=checkbox]{width:15px;height:15px;accent-color:var(--ac);flex-shrink:0}
+.chk label{margin:0;font-size:12px;color:var(--tx);text-transform:none;letter-spacing:0;cursor:pointer}
+.btn{display:block;width:100%;margin-top:22px;padding:13px;background:var(--ac);color:#000;border:none;border-radius:3px;font-family:inherit;font-size:13px;font-weight:700;letter-spacing:2px;cursor:pointer;text-transform:uppercase}
+.btn:hover{background:var(--ac2);color:var(--tx)}
+.st{margin-top:10px;font-size:12px;min-height:16px;color:var(--ac)}
+.lnk{margin-top:20px;font-size:11px}
+.lnk a{color:var(--mu);text-decoration:none}
+.lnk a:hover{color:var(--ac)}
 </style>
 </head><body>
-<div class="header">Foreasy - Configuração</div>
-<div class="card">
-  <div class="section">Rede 1 (primária)</div>
-  <label>Selecione rede (scan)</label>
+<header>
+  <div class="logo">FOREASY</div>
+  <div class="sub">configuração do dispositivo</div>
+</header>
+<main>
+  <div class="sec">Rede 1 — primária</div>
+  <label>Scan de redes</label>
   <select id="ssid"></select>
-  <label>Ou digite SSID manual</label>
-  <input id="manual_ssid" placeholder="SSID manual">
+  <label>SSID manual</label>
+  <input id="manual_ssid" placeholder="ou digita aqui">
   <label>Senha</label>
-  <input id="pass" type="text" placeholder="Senha (vazio se rede aberta)">
+  <input id="pass" type="text" placeholder="vazio se rede aberta">
 
-  <div class="section">Rede 2 (failover)</div>
-  <small>Opcional. O dispositivo alterna para esta rede quando a rede 1 falhar.</small>
-  <label>SSID</label>
-  <input id="ssid2" placeholder="SSID da rede 2 (opcional)">
+  <div class="sec">Rede 2 — failover</div>
+  <small style="color:var(--mu);font-size:11px;display:block;margin-top:6px">Opcional. Alterna automaticamente se a rede 1 falhar.</small>
+  <label>Scan de redes</label>
+  <select id="ssid2_scan"></select>
+  <label>SSID manual</label>
+  <input id="ssid2" placeholder="opcional">
   <label>Senha</label>
-  <input id="pass2" type="text" placeholder="Senha rede 2 (opcional)">
+  <input id="pass2" type="text" placeholder="opcional">
 
-  <div class="section">Dispositivo</div>
-  <label>NodeID</label>
+  <div class="sec">Dispositivo</div>
+  <label>Node ID</label>
   <input id="nodeid" placeholder="ex: C00045">
 
   <label>Modo do relé</label>
-  <div class="toggleRow">
-    <div id="modeNormal" class="toggleBtn active">Normal<br><small>segue WS</small></div>
-    <div id="modeOn"     class="toggleBtn">Sempre ON</div>
-    <div id="modeOff"    class="toggleBtn">Sempre OFF</div>
+  <div class="trow">
+    <div id="modeNormal" class="tgl active">Normal<small>segue WS</small></div>
+    <div id="modeOn"     class="tgl">Sempre ON</div>
+    <div id="modeOff"    class="tgl">Sempre OFF</div>
   </div>
 
   <label style="margin-top:14px">Tipo do relé</label>
-  <div class="toggleRow">
-    <div id="typeNA" class="toggleBtn active">NA<br><small>ON = HIGH</small></div>
-    <div id="typeNF" class="toggleBtn">NF<br><small>ON = LOW</small></div>
+  <div class="trow">
+    <div id="typeNA" class="tgl active">NA<small>ON = HIGH</small></div>
+    <div id="typeNF" class="tgl">NF<small>ON = LOW</small></div>
   </div>
 
-  <div class="chkRow">
+  <div class="chk">
     <input id="wsrestart" type="checkbox">
-    <label for="wsrestart">Reiniciar automaticamente se sem WebSocket por 1 hora</label>
+    <label for="wsrestart">Auto-restart se sem WebSocket por 1 hora</label>
   </div>
 
-  <button id="save" style="margin-top:18px">Salvar e Reiniciar</button>
-  <small id="status"></small>
-  <small style="margin-top:14px"><a href="/info">Informações do dispositivo</a></small>
-</div>
+  <button class="btn" id="save">Salvar e Reiniciar</button>
+  <div class="st" id="status"></div>
+  <div class="lnk"><a href="/info">→ /info</a></div>
+</main>
 <script>
 function qs(id){return document.getElementById(id);}
 let relayModeVal=0, relayTypeVal=0;
@@ -583,11 +620,13 @@ function scan(retry){
   fetch('/scan').then(r=>r.json()).then(list=>{
     if(list.length===0&&retry<6){setTimeout(()=>scan(retry+1),2500);return;}
     let s=qs('ssid'); s.innerHTML='';
+    let s2=qs('ssid2_scan'); s2.innerHTML='<option value="">— nenhuma —</option>';
     list.forEach(i=>{
       let o=document.createElement('option');
       o.value=i.ssid;
       o.textContent=i.ssid+' | '+i.rssi+' dBm | '+encText(i.enc);
       s.appendChild(o);
+      s2.appendChild(o.cloneNode(true));
     });
   }).catch(()=>{if(retry<6)setTimeout(()=>scan(retry+1),2500);});
 }
@@ -623,7 +662,7 @@ window.onload=()=>{
       headers:{'Content-Type':'application/x-www-form-urlencoded'},
       body:'ssid='+encodeURIComponent(ss)+
            '&pass='+encodeURIComponent(qs('pass').value)+
-           '&ssid2='+encodeURIComponent(qs('ssid2').value.trim())+
+           '&ssid2='+encodeURIComponent(qs('ssid2').value.trim()||qs('ssid2_scan').value)+
            '&pass2='+encodeURIComponent(qs('pass2').value)+
            '&nodeid='+encodeURIComponent(id)+
            '&relayMode='+relayModeVal+
@@ -712,61 +751,69 @@ void handleStatusJson() {
 // ========== /info ==========
 void handleInfoPage() {
   String html = R"rawliteral(
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Foreasy - Info</title>
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Foreasy — Info</title>
 <style>
-body{background:#eef6f0;font-family:Arial;margin:0;color:#222}
-.header{background:#198754;color:white;padding:18px;text-align:center;font-weight:700}
-.card{background:#fff;max-width:760px;margin:18px auto;padding:18px;border-radius:12px;box-shadow:0 6px 20px rgba(0,0,0,0.12)}
-.row{display:flex;gap:12px;flex-wrap:wrap}
-.item{flex:1;min-width:180px;padding:12px;border-radius:10px;background:#f7fff7;border:1px solid #e6f4ea}
-h4{margin:6px 0;color:#198754}
-a{color:#198754}
-pre{max-height:200px;overflow:auto;font-size:12px;background:#111827;color:#e5e7eb;padding:10px;border-radius:8px;margin-top:12px}
+:root{--bg:#0a0e0b;--cd:#111814;--bd:#1e3028;--ac:#00e676;--tx:#d4f5e0;--mu:#557060;--lb:#4ade80}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font-family:ui-monospace,'SF Mono',monospace;font-size:13px}
+header{background:var(--cd);border-bottom:1px solid var(--bd);padding:13px 18px}
+.logo{color:var(--ac);font-size:16px;font-weight:700;letter-spacing:3px}
+.sub{color:var(--mu);font-size:10px;letter-spacing:1px;margin-top:2px}
+main{max-width:880px;margin:0 auto;padding:14px 16px 28px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:8px}
+.it{background:var(--cd);border:1px solid var(--bd);border-radius:3px;padding:11px 13px}
+.lb{color:var(--lb);font-size:10px;letter-spacing:1px;text-transform:uppercase;margin-bottom:5px}
+.vl{color:var(--tx);font-size:14px;font-weight:600}
+pre{font-size:11px;background:#060a07;color:#4ade80;padding:10px;border-radius:3px;max-height:200px;overflow:auto;margin-top:14px;border:1px solid var(--bd);white-space:pre-wrap}
+.nav{margin-top:14px;font-size:11px;display:flex;gap:16px}
+.nav a{color:var(--mu);text-decoration:none}
+.nav a:hover{color:var(--ac)}
 </style></head><body>
-<div class="header">Foreasy - Informações (auto refresh 3s)</div>
-<div class="card">
-  <div class="row">
-    <div class="item"><h4>NodeID</h4><span id="nodeId">...</span></div>
-    <div class="item"><h4>Wi-Fi (STA)</h4><span id="ssid">...</span></div>
-    <div class="item"><h4>RSSI</h4><span id="rssi">...</span></div>
-    <div class="item"><h4>Temp (°C)</h4><span id="temp">...</span></div>
+<header>
+  <div class="logo">FOREASY</div>
+  <div class="sub">info — refresh 3s</div>
+</header>
+<main>
+  <div class="grid">
+    <div class="it"><div class="lb">Node ID</div><div class="vl" id="nodeId">…</div></div>
+    <div class="it"><div class="lb">Wi-Fi (STA)</div><div class="vl" id="ssid">…</div></div>
+    <div class="it"><div class="lb">RSSI</div><div class="vl" id="rssi">…</div></div>
+    <div class="it"><div class="lb">Temp (°C)</div><div class="vl" id="temp">…</div></div>
+    <div class="it"><div class="lb">IP (STA)</div><div class="vl" id="ip_sta">…</div></div>
+    <div class="it"><div class="lb">IP (AP)</div><div class="vl" id="ip_ap">…</div></div>
+    <div class="it"><div class="lb">WebSocket</div><div class="vl" id="ws">…</div></div>
+    <div class="it"><div class="lb">Relé</div><div class="vl" id="relay">…</div></div>
+    <div class="it"><div class="lb">WiFi Slot</div><div class="vl" id="wifiSlot">…</div></div>
+    <div class="it"><div class="lb">Boots</div><div class="vl" id="boots">…</div></div>
+    <div class="it"><div class="lb">Relay Mode</div><div class="vl" id="relayMode">…</div></div>
+    <div class="it"><div class="lb">Relay Type</div><div class="vl" id="relayType">…</div></div>
   </div>
-  <div style="height:10px"></div>
-  <div class="row">
-    <div class="item"><h4>IP (STA)</h4><span id="ip_sta">...</span></div>
-    <div class="item"><h4>IP (AP)</h4><span id="ip_ap">...</span></div>
-    <div class="item"><h4>WebSocket</h4><span id="ws">...</span></div>
-    <div class="item"><h4>Relé</h4><span id="relay">...</span></div>
+  <div class="nav">
+    <a href="/config">← /config</a>
+    <a href="/">← menu</a>
   </div>
-  <div style="height:10px"></div>
-  <div class="row">
-    <div class="item"><h4>WiFi Slot</h4><span id="wifiSlot">...</span></div>
-    <div class="item"><h4>Boots</h4><span id="boots">...</span></div>
-    <div class="item"><h4>Relay Mode</h4><span id="relayMode">...</span></div>
-    <div class="item"><h4>Relay Type</h4><span id="relayType">...</span></div>
-  </div>
-  <div style="margin-top:14px"><a href="/config">← Config</a> | <a href="/">Menu</a></div>
   <pre id="raw"></pre>
-</div>
+</main>
 <script>
 const modeLabel=['Normal','Sempre ON','Sempre OFF'];
 const typeLabel=['NA (ON=HIGH)','NF (ON=LOW)'];
 function upd(){
   fetch('/status').then(r=>r.json()).then(j=>{
-    nodeId.textContent   = j.nodeId||'—';
-    ssid.textContent     = j.ssid||'—';
-    rssi.textContent     = (j.rssi||0)+' dBm';
-    temp.textContent     = j.temp+'°C';
-    ip_sta.textContent   = j.ip_sta||'—';
-    ip_ap.textContent    = j.ip_ap||'—';
-    ws.textContent       = j.wsConnected ? 'Conectado' : 'Desconectado';
-    relay.textContent    = j.relayOn ? 'ON' : 'OFF';
-    wifiSlot.textContent = 'Slot '+(j.wifiSlot+1);
-    boots.textContent    = j.boots;
-    relayMode.textContent= modeLabel[j.relayMode]||j.relayMode;
-    relayType.textContent= typeLabel[j.relayType]||j.relayType;
-    raw.textContent      = JSON.stringify(j,null,2);
+    document.getElementById('nodeId').textContent    = j.nodeId||'—';
+    document.getElementById('ssid').textContent      = j.ssid||'—';
+    document.getElementById('rssi').textContent      = (j.rssi||0)+' dBm';
+    document.getElementById('temp').textContent      = j.temp+'°C';
+    document.getElementById('ip_sta').textContent    = j.ip_sta||'—';
+    document.getElementById('ip_ap').textContent     = j.ip_ap||'—';
+    document.getElementById('ws').textContent        = j.wsConnected ? 'Conectado' : 'Desconectado';
+    document.getElementById('relay').textContent     = j.relayOn ? 'ON' : 'OFF';
+    document.getElementById('wifiSlot').textContent  = 'Slot '+(j.wifiSlot+1);
+    document.getElementById('boots').textContent     = j.boots;
+    document.getElementById('relayMode').textContent = modeLabel[j.relayMode]||j.relayMode;
+    document.getElementById('relayType').textContent = typeLabel[j.relayType]||j.relayType;
+    document.getElementById('raw').textContent       = JSON.stringify(j,null,2);
   });
 }
 setInterval(upd,3000); upd();
@@ -803,51 +850,81 @@ void handleScan() {
 // ========== /relay ==========
 void handleRelayPage() {
   String html = R"rawliteral(
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Controle do Relé</title>
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Foreasy — Relé</title>
 <style>
-body{background:#eef6f0;font-family:Arial;margin:0;color:#222}
-.header{background:#198754;color:#fff;padding:18px;text-align:center;font-weight:700}
-.card{background:#fff;max-width:480px;margin:18px auto;padding:18px;border-radius:12px;box-shadow:0 6px 18px rgba(0,0,0,0.12)}
-button{padding:10px 12px;margin:6px;border-radius:10px;border:none;background:#198754;color:#fff;font-weight:700;cursor:pointer}
-label{display:block;margin-top:12px;font-weight:600}
-select{width:100%;padding:10px;border-radius:8px;border:1px solid #cfe9d8;margin-top:6px}
-.chkRow{display:flex;align-items:center;gap:8px;margin-top:8px}
-.chkRow input{width:auto}
-.small{font-size:13px;color:#555;margin-top:8px}
+:root{--bg:#0a0e0b;--cd:#111814;--bd:#1e3028;--ac:#00e676;--ac2:#009e55;--tx:#d4f5e0;--mu:#557060;--lb:#4ade80;--ip:#0d1710;--red:#f87171;--red2:#b91c1c}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font-family:ui-monospace,'Cascadia Code','SF Mono',monospace;font-size:13px}
+header{background:var(--cd);border-bottom:1px solid var(--bd);padding:14px 20px}
+.logo{color:var(--ac);font-size:18px;font-weight:700;letter-spacing:3px}
+.sub{color:var(--mu);font-size:10px;letter-spacing:1px;margin-top:2px}
+main{max-width:480px;margin:0 auto;padding:18px 16px 32px}
+.sec{color:var(--lb);font-size:10px;letter-spacing:2px;text-transform:uppercase;margin:22px 0 10px;padding-bottom:5px;border-bottom:1px solid var(--bd)}
+.state{background:var(--cd);border:1px solid var(--bd);border-radius:3px;padding:14px 16px;margin-bottom:4px;display:flex;align-items:center;justify-content:space-between}
+.state-lbl{color:var(--mu);font-size:10px;letter-spacing:1px;text-transform:uppercase}
+.state-val{font-size:20px;font-weight:700;color:var(--ac)}
+label{color:var(--mu);font-size:10px;letter-spacing:1px;text-transform:uppercase;display:block;margin:12px 0 4px}
+select{width:100%;background:var(--ip);color:var(--tx);border:1px solid var(--bd);border-radius:3px;padding:10px 12px;font-family:inherit;font-size:13px;outline:none}
+select option{background:var(--cd)}
+.chk{display:flex;align-items:center;gap:10px;margin-top:10px;padding:10px 12px;border:1px solid var(--bd);border-radius:3px;background:var(--cd)}
+.chk input[type=checkbox]{width:15px;height:15px;accent-color:var(--ac);flex-shrink:0}
+.chk span{font-size:12px;color:var(--tx)}
+.btn{display:block;width:100%;margin-top:14px;padding:12px;border:none;border-radius:3px;font-family:inherit;font-size:13px;font-weight:700;letter-spacing:1px;cursor:pointer;text-transform:uppercase}
+.btn-save{background:var(--ac);color:#000}
+.btn-save:hover{background:var(--ac2);color:var(--tx)}
+.btn-row{display:flex;gap:8px;margin-top:14px}
+.btn-on{flex:1;background:#003d1a;border:1px solid var(--ac);color:var(--ac)}
+.btn-on:hover{background:var(--ac);color:#000}
+.btn-off{flex:1;background:#3d0000;border:1px solid var(--red);color:var(--red)}
+.btn-off:hover{background:var(--red);color:#000}
+.st{margin-top:10px;font-size:12px;min-height:14px;color:var(--ac)}
+.note{margin-top:12px;color:var(--mu);font-size:11px;line-height:1.5;padding:10px 12px;border:1px solid var(--bd);border-radius:3px;background:var(--cd)}
+.nav{margin-top:20px;font-size:11px}
+.nav a{color:var(--mu);text-decoration:none}
+.nav a:hover{color:var(--ac)}
 </style></head><body>
-<div class="header">Controle do Relé</div>
-<div class="card">
-  <p><b>Estado atual:</b> <span id="relayState">...</span></p>
+<header>
+  <div class="logo">FOREASY</div>
+  <div class="sub">controle do relé</div>
+</header>
+<main>
+  <div class="state">
+    <div><div class="state-lbl">Estado atual</div></div>
+    <div class="state-val" id="relayState">…</div>
+  </div>
 
-  <label>MODO DO RELÉ</label>
+  <div class="sec">Configuração</div>
+  <label>Modo do relé</label>
   <select id="relayMode">
-    <option value="0">Normal (segue WebSocket)</option>
+    <option value="0">Normal — segue WebSocket</option>
     <option value="1">Sempre ON</option>
     <option value="2">Sempre OFF</option>
   </select>
 
-  <label style="margin-top:14px">TIPO DO RELÉ</label>
-  <div class="chkRow"><input type="checkbox" id="relayNA"><span>Normalmente Aberto (NA) — ON=HIGH</span></div>
-  <div class="chkRow"><input type="checkbox" id="relayNF"><span>Normalmente Fechado (NF) — ON=LOW</span></div>
+  <label style="margin-top:14px">Tipo do relé</label>
+  <div class="chk"><input type="checkbox" id="relayNA"><span>Normalmente Aberto (NA) — ON=HIGH</span></div>
+  <div class="chk"><input type="checkbox" id="relayNF"><span>Normalmente Fechado (NF) — ON=LOW</span></div>
 
-  <button id="saveCfg" style="width:100%;margin-top:14px">Salvar Configuração do Relé</button>
-  <div class="small" id="cfgStatus"></div>
+  <button class="btn btn-save" id="saveCfg">Salvar Configuração</button>
+  <div class="st" id="cfgStatus"></div>
 
-  <hr style="margin:18px 0">
-  <div style="text-align:center">
-    <button id="btnOn"  style="width:46%">Ligar</button>
-    <button id="btnOff" style="width:46%">Desligar</button>
+  <div class="sec">Controle manual</div>
+  <div class="btn-row">
+    <button class="btn btn-on"  id="btnOn">Ligar</button>
+    <button class="btn btn-off" id="btnOff">Desligar</button>
   </div>
-  <p class="small">Em modo <b>Sempre ON</b> ou <b>Sempre OFF</b> os comandos do WebSocket e os botões acima são ignorados.</p>
+  <div class="note">Em modo <b>Sempre ON</b> ou <b>Sempre OFF</b> os comandos do WebSocket e os botões acima são ignorados.</div>
 
-  <div style="margin-top:12px;text-align:center"><a href="/">Voltar</a></div>
-</div>
+  <div class="nav"><a href="/">← menu</a></div>
+</main>
 <script>
 function qs(id){return document.getElementById(id);}
 function loadStatus(){
   fetch('/status').then(r=>r.json()).then(j=>{
     qs('relayState').textContent = j.relayOn ? 'ON' : 'OFF';
+    qs('relayState').style.color = j.relayOn ? '#00e676' : '#f87171';
     qs('relayMode').value = j.relayMode!=null ? j.relayMode : 0;
     let t = j.relayType!=null ? j.relayType : 0;
     qs('relayNA').checked=(t===0); qs('relayNF').checked=(t===1);
@@ -906,25 +983,41 @@ void handleRelayConfigSave() {
 // ========== /nodeid ==========
 void handleNodeIdPage() {
   String html = R"rawliteral(
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Foreasy - NodeID</title>
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Foreasy — Node ID</title>
 <style>
-body{background:#eef6f0;font-family:Arial;margin:0;color:#222}
-.header{background:#198754;color:#fff;padding:20px;text-align:center;font-weight:700}
-.card{background:#fff;max-width:420px;margin:18px auto;padding:18px;border-radius:12px;box-shadow:0 6px 18px rgba(0,0,0,0.12)}
-input,button{width:100%;padding:12px;margin-top:10px;border-radius:8px;border:1px solid #cfe9d8;box-sizing:border-box}
-button{background:#198754;color:#fff;border:none;font-weight:700;cursor:pointer}
-small{color:#555;font-size:13px;display:block;margin-top:10px}
+:root{--bg:#0a0e0b;--cd:#111814;--bd:#1e3028;--ac:#00e676;--ac2:#009e55;--tx:#d4f5e0;--mu:#557060;--lb:#4ade80;--ip:#0d1710}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font-family:ui-monospace,'Cascadia Code','SF Mono',monospace;font-size:13px}
+header{background:var(--cd);border-bottom:1px solid var(--bd);padding:14px 20px}
+.logo{color:var(--ac);font-size:18px;font-weight:700;letter-spacing:3px}
+.sub{color:var(--mu);font-size:10px;letter-spacing:1px;margin-top:2px}
+main{max-width:420px;margin:0 auto;padding:24px 16px 32px}
+label{color:var(--mu);font-size:10px;letter-spacing:1px;text-transform:uppercase;display:block;margin-bottom:6px}
+input{width:100%;background:var(--ip);color:var(--tx);border:1px solid var(--bd);border-radius:3px;padding:10px 12px;font-family:inherit;font-size:13px;outline:none;transition:border-color .15s}
+input:focus{border-color:var(--ac)}
+.btn{display:block;width:100%;margin-top:16px;padding:13px;background:var(--ac);color:#000;border:none;border-radius:3px;font-family:inherit;font-size:13px;font-weight:700;letter-spacing:2px;cursor:pointer;text-transform:uppercase}
+.btn:hover{background:var(--ac2);color:var(--tx)}
+.st{margin-top:10px;font-size:12px;min-height:16px;color:var(--ac)}
+.note{margin-top:20px;padding:12px;background:var(--cd);border:1px solid var(--bd);border-radius:3px;color:var(--mu);font-size:11px;line-height:1.6}
+.note b{color:var(--tx)}
+.nav{margin-top:16px;font-size:11px}
+.nav a{color:var(--mu);text-decoration:none}
+.nav a:hover{color:var(--ac)}
 </style></head><body>
-<div class="header">Configuração de NodeID</div>
-<div class="card">
-  <label>NodeID atual</label>
+<header>
+  <div class="logo">FOREASY</div>
+  <div class="sub">configuração de node id</div>
+</header>
+<main>
+  <label>Node ID</label>
   <input id="nodeid" placeholder="ex: C00045">
-  <button id="save">Salvar NodeID e Reiniciar</button>
-  <small id="status"></small>
-  <small style="margin-top:14px">AP: SSID = <b>NodeID-AP</b> | Senha = <b>12345678</b> (ativo 10 min após boot)</small>
-  <p style="margin-top:14px"><a href="/">Voltar</a></p>
-</div>
+  <button class="btn" id="save">Salvar e Reiniciar</button>
+  <div class="st" id="status"></div>
+  <div class="note">AP: SSID = <b>NodeID-AP</b> | Senha = <b>12345678</b><br>Ativo por 10 min após cada boot.</div>
+  <div class="nav"><a href="/">← menu</a></div>
+</main>
 <script>
 function qs(id){return document.getElementById(id);}
 window.onload=()=>{
@@ -955,28 +1048,64 @@ void handleSaveNodeId() {
 // ========== /wifistatus ==========
 void handleWiFiStatusPage() {
   bool staOk = (WiFi.status() == WL_CONNECTED);
-  String html = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<style>body{background:#eef6f0;font-family:Arial;margin:0}.header{background:#198754;color:#fff;padding:18px;text-align:center;font-weight:700}.card{background:#fff;max-width:560px;margin:18px auto;padding:18px;border-radius:12px}</style>"
-    "<body><div class='header'>Status WiFi</div><div class='card'>"
-    "<p><b>SSID:</b> "     + (staOk ? WiFi.SSID() : String("—")) + "</p>"
-    "<p><b>RSSI:</b> "     + (staOk ? String(WiFi.RSSI()) + " dBm" : String("—")) + "</p>"
-    "<p><b>IP (STA):</b> " + (staOk ? WiFi.localIP().toString() : String("—")) + "</p>"
-    "<p><b>IP (AP):</b> "  + WiFi.softAPIP().toString() + "</p>"
-    "<p><b>Slot ativo:</b> Rede " + String(wifiSlot + 1) + "</p>"
-    "<p><a href='/'>Voltar</a></p></div></body></html>";
+  String html =
+    "<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Foreasy WiFi</title>"
+    "<style>"
+    ":root{--bg:#0a0e0b;--cd:#111814;--bd:#1e3028;--ac:#00e676;--tx:#d4f5e0;--mu:#557060;--lb:#4ade80}"
+    "*{box-sizing:border-box;margin:0;padding:0}"
+    "body{background:var(--bg);color:var(--tx);font-family:ui-monospace,'SF Mono',monospace;font-size:13px}"
+    "header{background:var(--cd);border-bottom:1px solid var(--bd);padding:13px 18px}"
+    ".logo{color:var(--ac);font-size:16px;font-weight:700;letter-spacing:3px}"
+    ".sub{color:var(--mu);font-size:10px;letter-spacing:1px;margin-top:2px}"
+    "main{max-width:480px;margin:0 auto;padding:18px 16px}"
+    ".it{background:var(--cd);border:1px solid var(--bd);border-radius:3px;padding:12px 14px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}"
+    ".lbl{color:var(--lb);font-size:10px;letter-spacing:1px;text-transform:uppercase}"
+    ".vl{color:var(--tx);font-size:13px;font-weight:600}"
+    ".nav{margin-top:16px;font-size:11px}"
+    ".nav a{color:var(--mu);text-decoration:none}"
+    ".nav a:hover{color:var(--ac)}"
+    "</style></head><body>"
+    "<header><div class='logo'>FOREASY</div><div class='sub'>status wi-fi</div></header>"
+    "<main>"
+    "<div class='it'><span class='lbl'>SSID</span><span class='vl'>" + (staOk ? WiFi.SSID() : String("—")) + "</span></div>"
+    "<div class='it'><span class='lbl'>RSSI</span><span class='vl'>" + (staOk ? String(WiFi.RSSI()) + " dBm" : String("—")) + "</span></div>"
+    "<div class='it'><span class='lbl'>IP (STA)</span><span class='vl'>" + (staOk ? WiFi.localIP().toString() : String("—")) + "</span></div>"
+    "<div class='it'><span class='lbl'>IP (AP)</span><span class='vl'>" + WiFi.softAPIP().toString() + "</span></div>"
+    "<div class='it'><span class='lbl'>Slot ativo</span><span class='vl'>Rede " + String(wifiSlot + 1) + "</span></div>"
+    "<div class='nav'><a href='/'>← menu</a></div>"
+    "</main></body></html>";
   server.send(200, "text/html", html);
 }
 
 // ========== /wsstatus ==========
 void handleWSStatusPage() {
-  String html = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<style>body{background:#eef6f0;font-family:Arial;margin:0}.header{background:#198754;color:#fff;padding:18px;text-align:center;font-weight:700}.card{background:#fff;max-width:560px;margin:18px auto;padding:18px;border-radius:12px}</style>"
-    "<body><div class='header'>Status WebSocket</div><div class='card'>"
-    "<p><b>Conectado:</b> "          + String(isWebSocketConnected ? "SIM" : "NÃO") + "</p>"
-    "<p><b>Servidor:</b> "           + String(wsHost) + "</p>"
-    "<p><b>Backoff atual:</b> "      + String(wsNextRetryMs) + " ms</p>"
-    "<p><b>wsRestartEnabled:</b> "   + String(wsRestartEnabled ? "SIM" : "NÃO") + "</p>"
-    "<p><a href='/'>Voltar</a></p></div></body></html>";
+  String html =
+    "<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Foreasy WS</title>"
+    "<style>"
+    ":root{--bg:#0a0e0b;--cd:#111814;--bd:#1e3028;--ac:#00e676;--tx:#d4f5e0;--mu:#557060;--lb:#4ade80}"
+    "*{box-sizing:border-box;margin:0;padding:0}"
+    "body{background:var(--bg);color:var(--tx);font-family:ui-monospace,'SF Mono',monospace;font-size:13px}"
+    "header{background:var(--cd);border-bottom:1px solid var(--bd);padding:13px 18px}"
+    ".logo{color:var(--ac);font-size:16px;font-weight:700;letter-spacing:3px}"
+    ".sub{color:var(--mu);font-size:10px;letter-spacing:1px;margin-top:2px}"
+    "main{max-width:480px;margin:0 auto;padding:18px 16px}"
+    ".it{background:var(--cd);border:1px solid var(--bd);border-radius:3px;padding:12px 14px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}"
+    ".lbl{color:var(--lb);font-size:10px;letter-spacing:1px;text-transform:uppercase}"
+    ".vl{color:var(--tx);font-size:13px;font-weight:600}"
+    ".nav{margin-top:16px;font-size:11px}"
+    ".nav a{color:var(--mu);text-decoration:none}"
+    ".nav a:hover{color:var(--ac)}"
+    "</style></head><body>"
+    "<header><div class='logo'>FOREASY</div><div class='sub'>status websocket</div></header>"
+    "<main>"
+    "<div class='it'><span class='lbl'>Conectado</span><span class='vl'>" + String(isWebSocketConnected ? "SIM" : "NÃO") + "</span></div>"
+    "<div class='it'><span class='lbl'>Servidor</span><span class='vl'>" + String(wsHost) + "</span></div>"
+    "<div class='it'><span class='lbl'>Backoff atual</span><span class='vl'>" + String(wsNextRetryMs) + " ms</span></div>"
+    "<div class='it'><span class='lbl'>Auto-restart</span><span class='vl'>" + String(wsRestartEnabled ? "SIM" : "NÃO") + "</span></div>"
+    "<div class='nav'><a href='/'>← menu</a></div>"
+    "</main></body></html>";
   server.send(200, "text/html", html);
 }
 

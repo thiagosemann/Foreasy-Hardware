@@ -1,8 +1,8 @@
 // ============================================================================
-// Foreasy ESP8266 — Modelo 2
-// Hardware: ESP8266 ESP-01S + shield relay GPIO V1
-//   Relay controlado diretamente via GPIO0 (sem MCU intermediário).
-//   Serial disponível em 115200 baud para debug (diferente do Modelo 1).
+// Foreasy ESP8266 — Modelos 1 e 5
+// Hardware Modelo 1: ESP8266 ESP-01S + shield relay serial AZ-Delivery (STC15F104W)
+// Hardware Modelo 5: ESP8266 ESP-01S + shield relay serial + SSR externo de alta corrente
+//   (o relay do shield aciona o SSR, que controla a carga da máquina)
 //
 // SISTEMA: Industrial ou Convencional — selecionado por machineMode na EEPROM
 //
@@ -12,18 +12,19 @@
 //   Usado para máquinas que aceitam um pulso elétrico para liberar um ciclo.
 //
 // MODO CONVENCIONAL (machineMode = 0):
-//   WS 0x01 => RELAY ON  (GPIO0 = relayOnLevel, fica ligado até OFF)
-//   WS 0x02 => RELAY OFF (GPIO0 = relayOffLevel)
+//   WS 0x01 => RELAY ON  (fica ligado até receber OFF)
+//   WS 0x02 => RELAY OFF
 //   Controle direto de energia — relay permanece no estado até novo comando.
 //
 // RELAY INVERT (relayInvert) — útil para relay NF (Normalmente Fechado):
-//   0 => normal    (ON=HIGH / OFF=LOW)
-//   1 => invertido (ON=LOW  / OFF=HIGH)
+//   0 => normal   (ON = envia relayOnCmd  | OFF = envia relayOffCmd)
+//   1 => invertido (ON = envia relayOffCmd | OFF = envia relayOnCmd)
 //
-// ATENÇÃO — GPIO0 é strapping pin do ESP8266:
-//   Durante o boot o GPIO0 deve estar HIGH (relay desligado se NA).
-//   O firmware força LOW logo no setup para garantir relay desligado.
-//   Watchdogs sem restart automático para evitar acionamento indesejado no boot.
+// RELAY: controlado via Serial 9600 baud → MCU STC15F104W (não via GPIO direto)
+//   ON  = bytes {0xA0, 0x01, 0x01, 0xA2}
+//   OFF = bytes {0xA0, 0x01, 0x00, 0xA1}
+//   Serial EXCLUSIVA do relay — sem debug por Serial após boot.
+//   Logs disponíveis apenas em HTTP /info enquanto o AP estiver ativo (10 min).
 //
 // MONITORAMENTO (independe do modo):
 //   WS 0x03 => responde JSON: rssi, ch, heap, block, cpu, uptime, boots, wifiSlot
@@ -31,7 +32,7 @@
 // WIFI:
 //   Dual WiFi: failover automático entre rede 1 e rede 2 sem restart.
 //   Conexão não-bloqueante (wifiTick). Credenciais nunca apagadas por falha.
-//   Scan WiFi síncrono (bloqueia durante o scan — diferença do Modelo 1).
+//   Scan WiFi assíncrono para não bloquear o loop.
 //
 // WEBSOCKET:
 //   Backoff exponencial 10s → 120s.
@@ -40,11 +41,7 @@
 //   wsRestartEnabled: reinicia o ESP após 1h sem WS (configurável via /config).
 //
 // AP: ativo 10 min após boot — SSID: <nodeId>-AP | Senha: 12345678
-//     Após expirar: AP desliga (lean mode). Logs críticos continuam via Serial.
-//
-// DEBUG (flags habilitadas neste arquivo):
-//   DEBUG_FLASH_INFO=true, DEBUG_EEPROM_DUMP=true, DEBUG_EEPROM_SECTORINFO=true
-//   Útil para diagnóstico de falhas de EEPROM.commit() em campo.
+//     Após expirar: AP desliga, logs do buffer são apagados (lean mode).
 //
 // EEPROM v4 (magic 0xF0EA5E01):
 //   ssid[32], pass[64], ssid2[32], pass2[64], nodeId[24],
@@ -63,9 +60,10 @@
 
 
 // ======================== CONFIG DEBUG =========================
-static const bool DEBUG_FLASH_INFO        = true;
-static const bool DEBUG_EEPROM_DUMP       = true;
-static const bool DEBUG_EEPROM_SECTORINFO = true;
+// DESATIVADO: Serial é exclusiva do relé (STC15F104W). Prints corrompem comandos.
+static const bool DEBUG_FLASH_INFO        = false;
+static const bool DEBUG_EEPROM_DUMP       = false;
+static const bool DEBUG_EEPROM_SECTORINFO = false;
 
 // ATENÇÃO: /save pode apagar setor antes de gravar. Útil para diagnóstico.
 // Se quiser mais conservador depois, mude para false.
@@ -79,12 +77,17 @@ static const char*    WS_HOST = "frst-back-02b607761078.herokuapp.com";
 static const uint16_t WS_PORT = 80;
 
 // ======================== IO (ESP-01/ESP-01S / Generic ESP8266) =========================
-static const int  relayPin = 0;  // GPIO0
+// NOTA: Relé controlado via Serial (STC15F104W), não via GPIO
 static const int  ledPin   = 2;  // GPIO2 (LED onboard costuma ser ativo LOW)
 static const bool LED_ACTIVE_LOW = true;
 
 // Pulso industrial
 static const uint16_t PULSE_MS = 100;
+
+// ======================== Comandos Serial para Relé =========================
+// Envia via Serial 9600 baud para o STC15F104W
+static uint8_t relayOnCmd[]  = {0xA0, 0x01, 0x01, 0xA2};  // Relé ON
+static uint8_t relayOffCmd[] = {0xA0, 0x01, 0x00, 0xA1};  // Relé OFF
 
 // ======================== AP =========================
 static IPAddress apIP(192, 168, 4, 1);
@@ -200,7 +203,12 @@ static void updateRelayLevels() {
 }
 
 static void applyRelayPhysical(bool on) {
-  digitalWrite(relayPin, on ? relayOnLevel : relayOffLevel);
+  bool physical = relayInvert ? !on : on;
+  if (physical) {
+    Serial.write(relayOnCmd, 4);
+  } else {
+    Serial.write(relayOffCmd, 4);
+  }
 }
 
 static void relayOffSafe() {
@@ -211,11 +219,7 @@ static void relayOffSafe() {
 
 // ======================== Helpers (Log) =========================
 static void log_append_line(const char* line) {
-  if (!apEnabled) {
-    Serial.print("[CRIT] ");
-    Serial.println(line);
-    return;
-  }
+  if (!apEnabled) return;  // Serial é do relé — sem fallback após AP desligar
 
   char tmp[300];
   unsigned long secs = millis() / 1000UL;
@@ -235,8 +239,7 @@ static void log_append_line(const char* line) {
 
   memcpy(logBuffer + cur, tmp, add);
   logBuffer[cur + add] = '\0';
-
-  Serial.print(tmp);
+  // Serial.print removido — Serial é exclusiva do relé (STC15F104W)
 }
 
 static void logf(const char* fmt, ...) {
@@ -378,15 +381,8 @@ static void debugEepromDump(uint16_t from = 0, uint16_t len = 64) {
 
 static bool diagEraseEepromSector() {
   uint32_t ideSz  = ESP.getFlashChipSize();
-  uint32_t realSz = ESP.getFlashChipRealSize();
   uint32_t sector = eepromSectorIndexFromFlashSize(ideSz);
-
-  Serial.println("[DIAG] Attempting flashEraseSector(last sector used for EEPROM)...");
-  Serial.printf("[DIAG] Flash Real=%u IDE=%u | sector=%lu\n",
-                realSz, ideSz, (unsigned long)sector);
-
   bool ok = ESP.flashEraseSector(sector);
-  Serial.printf("[DIAG] flashEraseSector result=%s\n", ok ? "true" : "false");
   return ok;
 }
 
@@ -414,43 +410,31 @@ static void applyPersistRuntime() {
 static void persistLoad() {
   EEPROM.get(0, P);
 
-  Serial.printf("[EEPROM] boot read: magic=0x%08lX ver=%u ssid='%s' node='%s' mode=%u invert=%u\n",
-                (unsigned long)P.magic, (unsigned)P.ver, P.ssid, P.nodeId,
-                (unsigned)P.machineMode, (unsigned)P.relayInvert);
-
   if (DEBUG_EEPROM_DUMP) debugEepromDump(0, 64);
 
   if (P.magic == EEPROM_MAGIC && P.ver == 3) {
-    Serial.println("[EEPROM] v3->v4 migration: preservando config, wsRestartEnabled=0");
+    // Migração v3 -> v4: preserva config, adiciona wsRestartEnabled=0
     P.ver = EEPROM_VER;
     P.wsRestartEnabled = 0;
     memset(P.reserved, 0, sizeof(P.reserved));
     EEPROM.put(0, P);
-    bool ok = EEPROM.commit();
-    Serial.printf("[EEPROM] migration commit=%s\n", ok ? "true" : "false");
+    EEPROM.commit();
   } else if (P.magic != EEPROM_MAGIC || P.ver != EEPROM_VER) {
-    Serial.println("[EEPROM] mismatch -> defaults");
     persistDefaults();
     EEPROM.put(0, P);
-    bool ok = EEPROM.commit();
-    Serial.printf("[EEPROM] defaults commit=%s\n", ok ? "true" : "false");
+    EEPROM.commit();
   }
 
   applyPersistRuntime();
 }
 
 static bool persistSaveAndVerifyOnce(uint8_t tryN) {
+  (void)tryN;
   EEPROM.put(0, P);
   bool ok = EEPROM.commit();
 
   Persist T;
   EEPROM.get(0, T);
-
-  Serial.printf("[EEPROM] try=%u save: commit=%s magic=0x%08lX ver=%u ssid='%s' node='%s' mode=%u invert=%u\n",
-                (unsigned)tryN,
-                ok ? "true" : "false",
-                (unsigned long)T.magic, (unsigned)T.ver, T.ssid, T.nodeId,
-                (unsigned)T.machineMode, (unsigned)T.relayInvert);
 
   if (DEBUG_EEPROM_DUMP) debugEepromDump(0, 64);
 
@@ -484,7 +468,7 @@ static void bumpWsBackoff()  { if (wsRetryStreak < 10) wsRetryStreak++; wsNextRe
 
 // ======================== Reconexão completa WiFi+WS (sem restart) =========================
 static void fullReconnectWiFiWS() {
-  Serial.println("[RECOVERY] Reconexão completa WiFi+WS (sem restart).");
+  logf("RECOVERY: Reconexao completa WiFi+WS.");
   webSocket.disconnect();
   isWebSocketConnected = false;
   delay(50);
@@ -503,7 +487,7 @@ static void fullReconnectWiFiWS() {
 
 static void switchWiFiSlot() {
   wifiSlot = (wifiSlot == 0) ? 1 : 0;
-  Serial.printf("[FAILOVER] Alternando para rede %u: SSID=%s\n", wifiSlot + 1, activeSSID());
+  logf("FAILOVER: Alternando para rede %u: SSID=%s", wifiSlot + 1, activeSSID());
   webSocket.disconnect();
   isWebSocketConnected = false;
   delay(50);
@@ -695,77 +679,82 @@ static void connectToWebSocket() {
 // ======================== HTTP pages =========================
 static const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
 <!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Foreasy - Configuração</title>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Foreasy — Config</title>
 <style>
-body{background:#eef6f0;font-family:Arial;margin:0;color:#222}
-.header{background:#198754;color:#fff;padding:20px;text-align:center;font-weight:700}
-.card{background:#fff;max-width:520px;margin:18px auto;padding:18px;border-radius:12px;box-shadow:0 6px 18px rgba(0,0,0,0.12)}
-input,select,button{width:100%;padding:12px;margin-top:10px;border-radius:8px;border:1px solid #cfe9d8;box-sizing:border-box}
-button{background:#198754;color:#fff;border:none;font-weight:700}
-small{color:#444;display:block;margin-top:10px;line-height:1.35}
-a{color:#198754}
-.toggleRow{display:flex;gap:10px;margin-top:10px}
-.toggleBtn{flex:1;border:1px solid #cfe9d8;border-radius:10px;padding:12px;cursor:pointer;background:#f7fff7}
-.toggleBtn.active{outline:2px solid #198754;border-color:#198754;font-weight:700}
-.chkRow{display:flex;align-items:center;gap:10px;margin-top:10px}
-.chkRow input{width:auto;margin:0}
-.section{font-weight:700;color:#198754;margin-top:18px;margin-bottom:2px;border-bottom:1px solid #cfe9d8;padding-bottom:4px}
+:root{--bg:#0a0e0b;--cd:#111814;--bd:#1e3028;--ac:#00e676;--ac2:#009e55;--tx:#d4f5e0;--mu:#557060;--lb:#4ade80;--ip:#0d1710}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font-family:ui-monospace,'Cascadia Code','SF Mono',monospace;font-size:13px}
+header{background:var(--cd);border-bottom:1px solid var(--bd);padding:14px 20px}
+.logo{color:var(--ac);font-size:18px;font-weight:700;letter-spacing:3px}
+.sub{color:var(--mu);font-size:10px;letter-spacing:1px;margin-top:2px}
+main{max-width:540px;margin:0 auto;padding:18px 16px 32px}
+.sec{color:var(--lb);font-size:10px;letter-spacing:2px;text-transform:uppercase;margin:22px 0 10px;padding-bottom:5px;border-bottom:1px solid var(--bd)}
+label{color:var(--mu);font-size:10px;letter-spacing:1px;text-transform:uppercase;display:block;margin:12px 0 4px}
+input,select{width:100%;background:var(--ip);color:var(--tx);border:1px solid var(--bd);border-radius:3px;padding:10px 12px;font-family:inherit;font-size:13px;outline:none;transition:border-color .15s}
+input:focus,select:focus{border-color:var(--ac)}
+select option{background:var(--cd)}
+.trow{display:flex;gap:8px;margin-top:8px}
+.tgl{flex:1;padding:11px 8px;border:1px solid var(--bd);border-radius:3px;cursor:pointer;text-align:center;background:var(--cd);color:var(--mu);font-size:12px;transition:all .15s;line-height:1.4}
+.tgl.active{background:#003d1a;border-color:var(--ac);color:var(--ac);font-weight:700}
+.tgl small{display:block;font-size:10px;opacity:.7;margin-top:2px}
+.chk{display:flex;align-items:center;gap:10px;margin-top:10px;padding:10px 12px;border:1px solid var(--bd);border-radius:3px;background:var(--cd)}
+.chk input[type=checkbox]{width:15px;height:15px;accent-color:var(--ac);flex-shrink:0}
+.chk label{margin:0;font-size:12px;color:var(--tx);text-transform:none;letter-spacing:0;cursor:pointer}
+.btn{display:block;width:100%;margin-top:22px;padding:13px;background:var(--ac);color:#000;border:none;border-radius:3px;font-family:inherit;font-size:13px;font-weight:700;letter-spacing:2px;cursor:pointer;text-transform:uppercase}
+.btn:hover{background:var(--ac2);color:var(--tx)}
+.st{margin-top:10px;font-size:12px;min-height:16px;color:var(--ac)}
+.lnk{margin-top:20px;display:flex;gap:16px;font-size:11px}
+.lnk a{color:var(--mu);text-decoration:none}
+.lnk a:hover{color:var(--ac)}
 </style>
 </head><body>
-<div class="header">Foreasy - Configuração</div>
-<div class="card">
-
-  <div class="section">Rede 1 (primária)</div>
-
-  <label>Selecione rede (scan)</label>
+<header>
+  <div class="logo">FOREASY</div>
+  <div class="sub">configuração do dispositivo</div>
+</header>
+<main>
+  <div class="sec">Rede 1 — primária</div>
+  <label>Scan de redes</label>
   <select id="ssid"></select>
-
-  <label>Ou digite SSID manual</label>
-  <input id="manual_ssid" placeholder="SSID manual">
-
+  <label>SSID manual</label>
+  <input id="manual_ssid" placeholder="ou digita aqui">
   <label>Senha</label>
-  <input id="pass" type="text" placeholder="Senha (vazio se rede aberta)">
+  <input id="pass" type="text" placeholder="vazio se rede aberta">
 
-  <div class="section">Rede 2 (secundária / failover)</div>
-  <small>Opcional. Se preenchida, o dispositivo alterna para esta rede quando a rede 1 falhar.</small>
-
+  <div class="sec">Rede 2 — failover</div>
+  <small style="color:var(--mu);font-size:11px;display:block;margin-top:6px">Opcional. Alterna automaticamente se a rede 1 falhar.</small>
   <label>SSID</label>
-  <input id="ssid2" placeholder="SSID da rede 2 (opcional)">
-
+  <input id="ssid2" placeholder="opcional">
   <label>Senha</label>
-  <input id="pass2" type="text" placeholder="Senha rede 2 (opcional)">
+  <input id="pass2" type="text" placeholder="opcional">
 
-  <div class="section">Dispositivo</div>
-
-  <label>NodeID</label>
+  <div class="sec">Dispositivo</div>
+  <label>Node ID</label>
   <input id="nodeid" placeholder="ex: I00047">
 
-  <label>Tipo de máquina</label>
-  <div class="toggleRow">
-    <div id="btnConv" class="toggleBtn">Convencional<br><small>0x01 liga / 0x02 desliga</small></div>
-    <div id="btnInd"  class="toggleBtn active">Industrial<br><small>0x01 = pulso</small></div>
+  <label>Modo da máquina</label>
+  <div class="trow">
+    <div id="btnConv" class="tgl">Convencional<small>0x01 liga / 0x02 desliga</small></div>
+    <div id="btnInd"  class="tgl active">Industrial<small>0x01 = pulso 100ms</small></div>
   </div>
 
-  <div class="chkRow">
+  <div class="chk">
     <input id="invert" type="checkbox">
     <label for="invert">Inverter lógica do relé (ON=LOW / OFF=HIGH)</label>
   </div>
-
-  <div class="chkRow">
+  <div class="chk">
     <input id="wsrestart" type="checkbox">
-    <label for="wsrestart">Reiniciar automaticamente se sem conexão por 1 hora</label>
+    <label for="wsrestart">Auto-restart se sem WebSocket por 1 hora</label>
   </div>
 
-  <button id="save" style="margin-top:18px">Salvar e Reiniciar</button>
-  <small id="status"></small>
-
-  <small style="margin-top:14px;">
-    <a href="/info">Abrir /info</a><br>
-    <a href="/diagflash" target="_blank">Rodar diagnóstico flash (/diagflash)</a>
-  </small>
-</div>
-</body>
+  <button class="btn" id="save">Salvar e Reiniciar</button>
+  <div class="st" id="status"></div>
+  <div class="lnk">
+    <a href="/info">→ /info</a>
+    <a href="/diagflash" target="_blank">→ /diagflash</a>
+  </div>
+</main>
 <script>
 function qs(id){return document.getElementById(id);}
 
@@ -775,7 +764,7 @@ function encText(enc){
   if(enc===2) return 'WPA-PSK';
   if(enc===3) return 'WPA2-PSK';
   if(enc===4) return 'WPA/WPA2-PSK';
-  return 'Desconhecido';
+  return '?';
 }
 
 let machineMode = 1;
@@ -785,17 +774,19 @@ function setMode(m){
   qs('btnInd').classList.toggle('active', m===1);
 }
 
-function scan(){
+function scan(retries){
+  retries=retries||0;
   fetch('/scan').then(r=>r.json()).then(list=>{
     let s=qs('ssid');
+    if(list.length===0&&retries<5){setTimeout(()=>scan(retries+1),3000);return;}
     s.innerHTML='';
     list.forEach(i=>{
       let o=document.createElement('option');
       o.value=i.ssid;
-      o.textContent = i.ssid + ' | ' + i.rssi + ' dBm | CH ' + i.channel + ' | ' + encText(i.enc);
+      o.textContent=i.ssid+' | '+i.rssi+' dBm | CH '+i.channel+' | '+encText(i.enc);
       s.appendChild(o);
     });
-  }).catch(()=>{});
+  }).catch(()=>{if(retries<5)setTimeout(()=>scan(retries+1),3000);});
 }
 
 window.onload=()=>{
@@ -849,7 +840,7 @@ window.onload=()=>{
   };
 };
 </script>
-</html>
+</body></html>
 )rawliteral";
 
 // ======================== HTTP handlers =========================
@@ -883,10 +874,23 @@ static void handleConfigPage() {
 static void handleScan() {
   if (!apEnabled) { server.send(200, "application/json", "[]"); return; }
 
-  log_append_line("Scan WiFi (/scan) iniciado...");
-  int n = WiFi.scanNetworks();
-  logf("Scan (/scan) concluído. n=%d", n);
+  int8_t n = WiFi.scanComplete();
 
+  if (n == WIFI_SCAN_RUNNING) {
+    // Scan ainda em andamento — retorna vazio, frontend tenta de novo
+    server.send(200, "application/json", "[]");
+    return;
+  }
+
+  if (n == WIFI_SCAN_FAILED || n < 0) {
+    // Inicia scan assíncrono (não bloqueia o loop)
+    WiFi.scanNetworks(true);
+    log_append_line("Scan WiFi iniciado (async).");
+    server.send(200, "application/json", "[]");
+    return;
+  }
+
+  // Scan concluído — monta JSON com os resultados
   const int MAXN = 25;
   int outN = (n > MAXN) ? MAXN : n;
 
@@ -897,9 +901,10 @@ static void handleScan() {
   for (int i = 0; i < outN; i++) {
     if (i > 0) server.sendContent(",");
 
-    String ssidS = WiFi.SSID(i);
+    char ssidRaw[33] = {0};
+    WiFi.SSID(i).toCharArray(ssidRaw, sizeof(ssidRaw));
     char ssEsc[160];
-    json_escape_into(ssidS.c_str(), ssEsc, sizeof(ssEsc));
+    json_escape_into(ssidRaw, ssEsc, sizeof(ssEsc));
 
     char obj[240];
     snprintf(obj, sizeof(obj),
@@ -982,12 +987,17 @@ static void handleInfoPage() {
   const size_t SHOW_MAX = 1400;
   if (logLen > SHOW_MAX) logStart = srcLog + (logLen - SHOW_MAX);
 
+  // Buffer local evita String temporária de WiFi.SSID() na heap
+  char currentSSID[33] = {0};
+  if (staOk) WiFi.SSID().toCharArray(currentSSID, sizeof(currentSSID));
+
   static char logEsc[2200];
   static char page[6800];
   html_escape_into(logStart, logEsc, sizeof(logEsc));
 
-  // Status do relé (físico) e lógico
-  const char* relayPhys = (digitalRead(relayPin) == relayOnLevel) ? "ON-level" : "OFF-level";
+  // Status do relé (via Serial)
+  bool physOn = relayInvert ? !relayLogicalOn : relayLogicalOn;
+  const char* relayPhys = physOn ? "ON" : "OFF";
   const char* relayLogic = relayLogicalOn ? "ON" : "OFF";
 
   int n = snprintf(
@@ -995,57 +1005,44 @@ static void handleInfoPage() {
     "<!doctype html><html><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<meta http-equiv='refresh' content='2'>"
-    "<title>Foreasy - Info</title>"
+    "<title>Foreasy Info</title>"
     "<style>"
-    "body{background:#eef6f0;font-family:Arial;margin:0;color:#222}"
-    ".header{background:#198754;color:white;padding:18px;text-align:center;font-weight:700}"
-    ".card{background:#fff;max-width:860px;margin:18px auto;padding:18px;border-radius:12px;box-shadow:0 6px 20px rgba(0,0,0,0.12)}"
-    ".row{display:flex;gap:12px;flex-wrap:wrap}"
-    ".item{flex:1;min-width:240px;padding:12px;border-radius:10px;background:#f7fff7;border:1px solid #e6f4ea}"
-    "h4{margin:6px 0;color:#198754}"
-    ".mono{font-family:monospace;font-size:12px;white-space:pre-wrap;background:#111827;color:#e5e7eb;padding:10px;border-radius:10px;max-height:320px;overflow:auto}"
-    "a{color:#198754}"
-    ".badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;background:#e8f5ee;border:1px solid #cfe9d8}"
+    ":root{--bg:#0a0e0b;--cd:#111814;--bd:#1e3028;--ac:#00e676;--tx:#d4f5e0;--mu:#557060;--lb:#4ade80}"
+    "*{box-sizing:border-box;margin:0;padding:0}"
+    "body{background:var(--bg);color:var(--tx);font-family:ui-monospace,'SF Mono',monospace;font-size:13px}"
+    "header{background:var(--cd);border-bottom:1px solid var(--bd);padding:13px 18px}"
+    ".logo{color:var(--ac);font-size:16px;font-weight:700;letter-spacing:3px}"
+    ".sub{color:var(--mu);font-size:10px;letter-spacing:1px;margin-top:2px}"
+    "main{max-width:880px;margin:0 auto;padding:14px 16px}"
+    ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px}"
+    ".it{background:var(--cd);border:1px solid var(--bd);border-radius:3px;padding:11px 13px}"
+    ".lb{color:var(--lb);font-size:10px;letter-spacing:1px;text-transform:uppercase;margin-bottom:5px}"
+    ".vl{color:var(--tx);font-size:14px;font-weight:600}"
+    ".bk{display:inline-block;padding:2px 7px;border-radius:2px;font-size:12px;background:#003d1a;border:1px solid var(--bd);color:var(--ac)}"
+    ".log{font-size:11px;white-space:pre-wrap;background:#060a07;color:#4ade80;padding:10px;border-radius:3px;max-height:280px;overflow:auto;margin-top:12px;border:1px solid var(--bd)}"
+    "a{color:var(--ac);text-decoration:none}"
     "</style></head><body>"
-    "<div class='header'>Foreasy - /info (auto refresh 2s)</div>"
-    "<div class='card'>"
-
-    "<div class='row'>"
-      "<div class='item'><h4>NodeID</h4><div>%s</div></div>"
-      "<div class='item'><h4>Wi-Fi salvo</h4><div>%s</div></div>"
-      "<div class='item'><h4>Wi-Fi atual (STA)</h4><div>%s</div></div>"
-    "</div>"
-
-    "<div style='height:12px'></div>"
-    "<div class='row'>"
-      "<div class='item'><h4>RSSI</h4><div>%s</div></div>"
-      "<div class='item'><h4>IP (STA)</h4><div>%s</div></div>"
-      "<div class='item'><h4>IP (AP)</h4><div>%s</div></div>"
-    "</div>"
-
-    "<div style='height:12px'></div>"
-    "<div class='row'>"
-      "<div class='item'><h4>WebSocket</h4><div>%s</div></div>"
-      "<div class='item'><h4>Tipo de máquina</h4><div>%s</div></div>"
-      "<div class='item'><h4>Relé invert?</h4><div>%s</div></div>"
-    "</div>"
-
-    "<div style='height:12px'></div>"
-    "<div class='row'>"
-      "<div class='item'><h4>Relé físico</h4><div>%s</div></div>"
-      "<div class='item'><h4>Relé lógico (conv)</h4><div>%s</div></div>"
-      "<div class='item'><h4>Pulso (ind)</h4><div>%s</div></div>"
-    "</div>"
-
-    "<div style='height:12px'></div>"
-    "<div class='row'>"
-      "<div class='item'><h4>AP ativo?</h4><div>%s</div></div>"
-      "<div class='item'><h4>Boots (RAM)</h4><div><span class='badge'>%s</span></div></div>"
-      "<div class='item'><h4>Último reset</h4><div>%s (%u)</div></div>"
+    "<header><div class='logo'>FOREASY</div><div class='sub'>info — refresh 2s</div></header>"
+    "<main><div class='grid'>"
+    "<div class='it'><div class='lb'>Node ID</div><div class='vl'>%s</div></div>"
+    "<div class='it'><div class='lb'>WiFi salvo</div><div class='vl'>%s</div></div>"
+    "<div class='it'><div class='lb'>WiFi atual</div><div class='vl'>%s</div></div>"
+    "<div class='it'><div class='lb'>RSSI</div><div class='vl'>%s</div></div>"
+    "<div class='it'><div class='lb'>IP (STA)</div><div class='vl'>%s</div></div>"
+    "<div class='it'><div class='lb'>IP (AP)</div><div class='vl'>%s</div></div>"
+    "<div class='it'><div class='lb'>WebSocket</div><div class='vl'>%s</div></div>"
+    "<div class='it'><div class='lb'>Modo máquina</div><div class='vl'>%s</div></div>"
+    "<div class='it'><div class='lb'>Relé invert</div><div class='vl'>%s</div></div>"
+    "<div class='it'><div class='lb'>Relé físico</div><div class='vl'>%s</div></div>"
+    "<div class='it'><div class='lb'>Relé lógico</div><div class='vl'>%s</div></div>"
+    "<div class='it'><div class='lb'>Pulso</div><div class='vl'>%s</div></div>"
+    "<div class='it'><div class='lb'>AP ativo</div><div class='vl'>%s</div></div>"
+    "<div class='it'><div class='lb'>Boots</div><div class='vl'><span class='bk'>%s</span></div></div>"
+    "<div class='it'><div class='lb'>Último reset</div><div class='vl'>%s (%u)</div></div>"
     "</div>",
     (P.nodeId[0] ? P.nodeId : "—"),
     wifiSavedBuf,
-    (staOk ? WiFi.SSID().c_str() : "—"),
+    (staOk ? currentSSID : "—"),
     rssiBuf,
     ipsta,
     ipap,
@@ -1067,16 +1064,16 @@ static void handleInfoPage() {
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "text/html", "");
     server.sendContent(page);
-    server.sendContent("<div style='height:14px'></div><h4>Logs (ultimos ~1400 chars)</h4><div class='mono'>");
+    server.sendContent("<div style='margin-top:14px;color:#4ade80;font-size:10px;letter-spacing:1px;text-transform:uppercase;padding-bottom:6px;border-bottom:1px solid #1e3028'>Logs</div><div class='log'>");
     server.sendContent(logEsc);
     server.sendContent("</div>");
-    server.sendContent("<div style='margin-top:14px'><a href='/config'>Voltar /config</a></div></div></body></html>");
+    server.sendContent("<div style='margin-top:14px;font-size:11px'><a href='/config' style='color:#00e676;text-decoration:none'>← /config</a></div></main></body></html>");
   } else {
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "text/html", "");
     server.sendContent(page);
-    server.sendContent("<div style='height:14px'></div><div style='color:#555'>Logs desativados após o AP desligar (lean mode).</div>");
-    server.sendContent("<div style='margin-top:14px'><a href='/config'>Voltar /config</a></div></div></body></html>");
+    server.sendContent("<div style='margin-top:14px;color:#557060;font-size:11px'>Logs desativados (lean mode).</div>");
+    server.sendContent("<div style='margin-top:14px;font-size:11px'><a href='/config' style='color:#00e676;text-decoration:none'>← /config</a></div></main></body></html>");
   }
 }
 
@@ -1131,23 +1128,20 @@ static void handleSave() {
   delay(120);
   yield();
 
-  Serial.println("[EEPROM] save requested");
   if (DEBUG_EEPROM_SECTORINFO) debugEepromSectorInfo();
 
   if (ERASE_SECTOR_BEFORE_SAVE) {
-    bool eok = diagEraseEepromSector();
-    Serial.printf("[EEPROM] eraseBeforeSave=%s\n", eok ? "true" : "false");
+    diagEraseEepromSector();
     delay(50);
     yield();
   }
 
-  bool ok = persistSaveAndVerifyRetry(COMMIT_TRIES);
+  persistSaveAndVerifyRetry(COMMIT_TRIES);
 
   EEPROM.end();
   delay(250);
   yield();
 
-  Serial.printf("[EEPROM] save ok=%s\n", ok ? "true" : "false");
   delay(200);
 
   ESP.restart();
@@ -1255,7 +1249,7 @@ static void watchdogTick() {
     if (wifiOk && !wsOk) {
       if (wsDownSinceMs == 0) wsDownSinceMs = millis();
       if ((millis() - wsDownSinceMs) > WS_DOWN_RESET_MS) {
-        Serial.println("[CRIT] WATCHDOG: WS down > 5min. Failover/reconexão WiFi+WS.");
+        logf("WATCHDOG: WS down > 5min. Failover.");
         failoverReconnect();
       }
     } else {
@@ -1265,8 +1259,8 @@ static void watchdogTick() {
     // Sem WiFi e sem WS por mais de 8 min => reconexão completa (sem restart)
     if (!wifiOk && !wsOk) {
       if ((millis() - lastConnectivityOkMs) > GLOBAL_DOWN_RESET_MS) {
-        Serial.println("[CRIT] GLOBAL WD: sem WiFi e sem WS por muito tempo. Failover/reconexão.");
-        lastConnectivityOkMs = millis(); // reseta o timer para não disparar em loop
+        logf("GLOBAL WD: sem WiFi e WS por muito tempo. Failover.");
+        lastConnectivityOkMs = millis();
         failoverReconnect();
       }
     }
@@ -1297,25 +1291,19 @@ static void wsRestartTick() {
 
 // ======================== SETUP / LOOP =========================
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);  // IMPORTANTE: 9600 baud para comunicar com STC15F104W
   delay(60);
 
   debugFlashInfoOnce();
 
   pinMode(ledPin, OUTPUT);
-  pinMode(relayPin, OUTPUT);
-  digitalWrite(0, LOW); // mantém relé desligado (se for ativo LOW)
+  // Relé controlado via Serial, não precisa pinMode
 
   setLed(false);
   lastLedState = false;
 
-  // default relay levels
-  //updateRelayLevels();
-  relayOffSafe();
-
   logBuffer[0] = '\0';
 
-  Serial.println("[EEPROM] begin (setup)");
   EEPROM.begin(EEPROM_SIZE);
   if (DEBUG_EEPROM_SECTORINFO) debugEepromSectorInfo();
 
