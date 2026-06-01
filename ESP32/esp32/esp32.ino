@@ -243,8 +243,7 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       wsLastOkMs  = millis();
       wsDownSinceMs = 0;
       resetWsBackoff();
-      bool effectiveOn = isRelayEffectiveOn();
-      String msg = (effectiveOn ? "ID:" : "NID:") + nodeId;
+      String msg = "ID:" + nodeId;
       webSocket.sendTXT(msg);
       Serial.printf("WS conectado. Sent: %s\n", msg.c_str());
       break;
