@@ -2,42 +2,48 @@
 // Foreasy ESP32 — Modelos 3 e 4
 // Hardware: ESP32 + shield relé 30A | Modelo 4 usa SSR acionado pelo relé 30A
 //
-// SISTEMA: Convencional — controle direto de energia (relay ON/OFF)
-//   Não há lógica de pulso ou integração com conector Speed Queen H3/H5.
-//   O backend liga ou desliga o relay; o relay libera ou corta a energia da máquina.
+// SISTEMA: Industrial ou Convencional — selecionado por machineMode
 //
-// CONFIGURAÇÃO DO RELAY (persistente via Preferences/NVS):
-// - relayMode : 0 = Normal (obedece WS) | 1 = Sempre ON | 2 = Sempre OFF
-// - relayType : 0 = NA — Normalmente Aberto (ON=HIGH) | 1 = NF — Normalmente Fechado (ON=LOW)
-//   Em modo Sempre ON/OFF os comandos do WS e botões locais são ignorados.
+// MODO INDUSTRIAL (machineMode = 1) — padrão de fábrica:
+//   WS 0x01 => PULSO: relay fecha por PULSE_MS (100ms) depois abre automaticamente
+//   WS 0x02 => ignorado
+//
+// MODO CONVENCIONAL (machineMode = 0):
+//   WS 0x01 => RELAY ON  (fica ligado até receber OFF)
+//   WS 0x02 => RELAY OFF
+//
+// RELAY INVERT (relayInvert) — útil para relay NF (Normalmente Fechado):
+//   false => normal   (ON = HIGH | OFF = LOW)
+//   true  => invertido (ON = LOW  | OFF = HIGH)
+//
+// RELAY MODE (persistente):
+//   relayMode 0 = Normal (obedece WS + machineMode)
+//   relayMode 1 = Sempre ON   (ignora WS e machineMode)
+//   relayMode 2 = Sempre OFF  (ignora WS e machineMode)
 //
 // PROTOCOLO WEBSOCKET (binário):
-// - 0x01 => Relay ON  (ignorado se relayMode != 0)
-// - 0x02 => Relay OFF (ignorado se relayMode != 0)
-// - 0x03 => Responde JSON com rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, temp
+//   0x01 => INDUSTRIAL: pulso 100ms | CONVENCIONAL: Relay ON  (se relayMode=0)
+//   0x02 => INDUSTRIAL: ignorado    | CONVENCIONAL: Relay OFF (se relayMode=0)
+//   0x03 => JSON: rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, temp
 //
-// WIFI:
-// - Dual WiFi com failover automático entre rede 1 e rede 2 (sem restart)
-// - Conexão não-bloqueante: wifiTick() com timeout 40s e retry a cada 5s
-// - Credenciais NUNCA apagadas por falha de conexão
+// WIFI: Dual WiFi com failover automático (sem restart)
+//   Conexão não-bloqueante, credenciais nunca apagadas por falha
 //
 // WEBSOCKET:
-// - Backoff exponencial: 10s base → 120s máximo
-// - Watchdog WS down  : sem WS por >5min  → failover WiFi+WS
-// - Watchdog global   : sem WiFi+WS >8min → failover
-// - Detecção de zumbi : sem ping/pong por >5min → reconecta
-// - App ping a cada 30s | heartbeat: 15s/3s/2 tentativas
-// - wsRestartEnabled  : reinicia ESP32 após 1h sem WS (opcional, configurável)
+//   Backoff exponencial: 10s base → 120s máx
+//   Watchdog WS down  : sem WS >5min  → failover
+//   Watchdog global   : sem WiFi+WS >8min → failover
+//   Zumbi             : sem ping/pong >5min → reconecta
+//   wsRestartEnabled  : reinicia após 1h sem WS (configurável)
 //
-// AP: ativo 10 min após boot (lean mode após expirar)
-//     SSID: <nodeId>-AP | Senha: 12345678
+// AP: ativo 10 min após boot | SSID: <nodeId>-AP | Senha: 12345678
 //
-// ARMAZENAMENTO: Preferences (NVS) — ssid, pass, ssid2, pass2, nodeid,
-//                relayMode, relayType, wsrestart, bootCount
-// bootCount incrementado em RAM; salvo apenas no /save (evita desgaste da flash)
+// ARMAZENAMENTO: Preferences (NVS)
+//   ssid, pass, ssid2, pass2, nodeid, machineMode, relayMode, relayInvert,
+//   wsrestart, bootCount
+//   bootCount incrementado em RAM; salvo apenas no /save
 //
-// SCAN WIFI: assíncrono (não bloqueia o loop)
-// TEMPERATURA: sensor interno do ESP32 via temprature_sens_read()
+// SCAN WIFI: assíncrono | TEMPERATURA: temprature_sens_read()
 // ============================================================================
 
 #include <WiFi.h>
@@ -45,7 +51,6 @@
 #include <WebSocketsClient.h>
 #include <Preferences.h>
 
-// ======== Internal temp (ESP32) ========
 float readInternalTempC() {
   return temperatureRead();
 }
@@ -58,9 +63,16 @@ Preferences prefs;
 const int ledPin   = 4;
 const int relayPin = 2;
 
+// ---------- Machine Mode ----------
+enum MachineMode : uint8_t { MODE_CONVENTIONAL = 0, MODE_INDUSTRIAL = 1 };
+MachineMode machineMode = MODE_INDUSTRIAL;
+const uint16_t PULSE_MS = 100;
+bool     pulseActive = false;
+uint32_t pulseEndMs  = 0;
+
 // ---------- Relay ----------
 int  relayMode      = 0;   // 0=Normal, 1=Sempre ON, 2=Sempre OFF
-int  relayType      = 0;   // 0=NA, 1=NF
+bool relayInvert    = false;
 bool relayLogicalOn = false;
 int  relayOnLevel   = HIGH;
 int  relayOffLevel  = LOW;
@@ -68,9 +80,9 @@ int  relayOffLevel  = LOW;
 // ---------- Identity ----------
 String nodeId = "FOREASY";
 
-// ---------- Credenciais cacheadas (carregadas no boot) ----------
+// ---------- Credenciais cacheadas ----------
 String sSsid, sPass, sSsid2, sPass2;
-uint8_t wifiSlot = 0;  // 0=rede1, 1=rede2
+uint8_t wifiSlot = 0;
 
 const char* activeSSID() { return wifiSlot == 0 ? sSsid.c_str() : sSsid2.c_str(); }
 const char* activePass() { return wifiSlot == 0 ? sPass.c_str() : sPass2.c_str(); }
@@ -125,18 +137,30 @@ uint32_t bootCount = 0;
 
 // ================= RELAY HELPERS =================
 void updateRelayLevels() {
-  if (relayType == 0) { relayOnLevel = HIGH; relayOffLevel = LOW; }
-  else                { relayOnLevel = LOW;  relayOffLevel = HIGH; }
+  if (!relayInvert) { relayOnLevel = HIGH; relayOffLevel = LOW; }
+  else              { relayOnLevel = LOW;  relayOffLevel = HIGH; }
 }
 
 bool isRelayEffectiveOn() {
   if (relayMode == 1) return true;
   if (relayMode == 2) return false;
+  if (machineMode == MODE_INDUSTRIAL) return pulseActive;
   return relayLogicalOn;
 }
 
 void applyRelayOutput() {
   digitalWrite(relayPin, isRelayEffectiveOn() ? relayOnLevel : relayOffLevel);
+}
+
+// ================= RELAY TICK (pulse end) =================
+void handleRelayTick() {
+  if (relayMode == 0 && machineMode == MODE_INDUSTRIAL) {
+    if (pulseActive && (int32_t)(millis() - pulseEndMs) >= 0) {
+      pulseActive = false;
+      applyRelayOutput();
+      if (isWebSocketConnected) webSocket.sendTXT("RelayStatus:ON");
+    }
+  }
 }
 
 // ================= WS BACKOFF =================
@@ -189,15 +213,16 @@ void failoverReconnect() {
 
 // ================= PREFS =================
 void loadPrefs() {
-  nodeId           = prefs.getString("nodeid",    "FOREASY");
-  sSsid            = prefs.getString("ssid",      "");
-  sPass            = prefs.getString("pass",      "");
-  sSsid2           = prefs.getString("ssid2",     "");
-  sPass2           = prefs.getString("pass2",     "");
-  relayMode        = prefs.getInt("relayMode",    0);
-  relayType        = prefs.getInt("relayType",    0);
-  wsRestartEnabled = (prefs.getInt("wsrestart",   0) != 0);
-  bootCount        = prefs.getUInt("bootCount",   0);
+  nodeId           = prefs.getString("nodeid",      "FOREASY");
+  sSsid            = prefs.getString("ssid",        "");
+  sPass            = prefs.getString("pass",        "");
+  sSsid2           = prefs.getString("ssid2",       "");
+  sPass2           = prefs.getString("pass2",       "");
+  machineMode      = (MachineMode)prefs.getInt("machineMode", 1);
+  relayMode        = prefs.getInt("relayMode",      0);
+  relayInvert      = (prefs.getInt("relayInvert",   0) != 0);
+  wsRestartEnabled = (prefs.getInt("wsrestart",     0) != 0);
+  bootCount        = prefs.getUInt("bootCount",     0);
 }
 
 // ================= AP + STA =================
@@ -237,13 +262,14 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED: {
       isWebSocketConnected = true;
-      lastPingMs  = millis();
-      wsLastOkMs  = millis();
+      lastPingMs   = millis();
+      wsLastOkMs   = millis();
       wsDownSinceMs = 0;
       resetWsBackoff();
-      String msg = "ID:" + nodeId;
+      String msg = isRelayEffectiveOn() ? ("ID:" + nodeId) : ("NID:" + nodeId);
       webSocket.sendTXT(msg);
-      Serial.printf("WS conectado. Sent: %s\n", msg.c_str());
+      Serial.printf("WS conectado. Sent: %s | mode=%s\n", msg.c_str(),
+                    machineMode == MODE_INDUSTRIAL ? "INDUSTRIAL" : "CONVENCIONAL");
       break;
     }
 
@@ -268,9 +294,11 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 
         if (b == 0x03) {
           bool staOk = (WiFi.status() == WL_CONNECTED);
-          char buf[260];
+          char buf[280];
           snprintf(buf, sizeof(buf),
-            "{\"rssi\":%d,\"ch\":%d,\"heap\":%u,\"block\":%u,\"cpu\":%u,\"uptime\":%lu,\"boots\":%lu,\"wifiSlot\":%u,\"temp\":%.1f}",
+            "{\"rssi\":%d,\"ch\":%d,\"heap\":%u,\"block\":%u,\"cpu\":%u,"
+            "\"uptime\":%lu,\"boots\":%lu,\"wifiSlot\":%u,\"temp\":%.1f,"
+            "\"machineMode\":%u,\"pulse\":%s}",
             staOk ? WiFi.RSSI() : 0,
             staOk ? (int)WiFi.channel() : 0,
             (unsigned)ESP.getFreeHeap(),
@@ -279,16 +307,25 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             (unsigned long)(millis() / 1000UL),
             (unsigned long)bootCount,
             (unsigned)wifiSlot,
-            readInternalTempC()
+            readInternalTempC(),
+            (unsigned)machineMode,
+            pulseActive ? "true" : "false"
           );
           webSocket.sendTXT(buf);
           break;
         }
 
         if (relayMode == 0) {
-          if      (b == 0x01) relayLogicalOn = true;
-          else if (b == 0x02) relayLogicalOn = false;
-          applyRelayOutput();
+          if (machineMode == MODE_INDUSTRIAL) {
+            if (b == 0x01 && !pulseActive) {
+              pulseActive = true;
+              pulseEndMs  = millis() + PULSE_MS;
+              applyRelayOutput();
+            }
+          } else {
+            if      (b == 0x01) { relayLogicalOn = true;  applyRelayOutput(); }
+            else if (b == 0x02) { relayLogicalOn = false; applyRelayOutput(); }
+          }
         }
         webSocket.sendTXT(isRelayEffectiveOn() ? "RelayStatus:ON" : "RelayStatus:OFF");
       }
@@ -306,8 +343,7 @@ void setup() {
 
   prefs.begin("wifi", false);
   loadPrefs();
-
-  bootCount++;  // incrementa em RAM; salvo apenas no /save
+  bootCount++;
 
   updateRelayLevels();
 
@@ -315,12 +351,13 @@ void setup() {
   digitalWrite(ledPin, LOW);
   pinMode(relayPin, OUTPUT);
   relayLogicalOn = false;
+  pulseActive    = false;
   applyRelayOutput();
 
-  bootTimeMs            = millis();
-  apEnabled             = true;
-  lastConnectivityOkMs  = millis();
-  wsLastOkMs            = millis();
+  bootTimeMs           = millis();
+  apEnabled            = true;
+  lastConnectivityOkMs = millis();
+  wsLastOkMs           = millis();
   resetWsBackoff();
 
   WiFi.setAutoReconnect(false);
@@ -329,9 +366,10 @@ void setup() {
   setupAPSTA();
   startWebServer();
   server.begin();
-  Serial.println("HTTP server iniciado.");
+  Serial.printf("HTTP server iniciado. machineMode=%s relayInvert=%s\n",
+                machineMode == MODE_INDUSTRIAL ? "INDUSTRIAL" : "CONVENCIONAL",
+                relayInvert ? "true" : "false");
 
-  // Inicia scan assíncrono para /config page
   WiFi.scanNetworks(true);
 
   if (hasSavedWiFi()) connectToWiFi_begin();
@@ -343,6 +381,7 @@ void loop() {
   server.handleClient();
   wifiTick();
   wsTick();
+  handleRelayTick();
   watchdogTick();
   apLifetimeTick();
   wsRestartTick();
@@ -440,7 +479,7 @@ void apLifetimeTick() {
 void wsRestartTick() {
   if (!wsRestartEnabled) return;
   if (isWebSocketConnected) { wsLastOkMs = millis(); return; }
-  if (isRelayEffectiveOn())  { wsLastOkMs = millis(); return; }  // não reinicia com relé ativo
+  if (isRelayEffectiveOn())  { wsLastOkMs = millis(); return; }
   if ((millis() - wsLastOkMs) > WS_RESTART_TIMEOUT_MS) {
     Serial.println("WS_RESTART: sem WS por 1h. Reiniciando.");
     delay(200);
@@ -450,23 +489,23 @@ void wsRestartTick() {
 
 // ================= HTTP ROUTES =================
 void startWebServer() {
-  server.on("/",              handleRoot);
-  server.on("/config",        handleConfigPage);
-  server.on("/config-data",   HTTP_GET,  handleConfigData);
-  server.on("/info",          handleInfoPage);
-  server.on("/scan",          HTTP_GET,  handleScan);
-  server.on("/save",          HTTP_POST, handleSave);
-  server.on("/status",        HTTP_GET,  handleStatusJson);
-  server.on("/relay",         HTTP_GET,  handleRelayPage);
-  server.on("/relay/on",      HTTP_GET,  handleRelayOn);
-  server.on("/relay/off",     HTTP_GET,  handleRelayOff);
-  server.on("/relay/config",  HTTP_POST, handleRelayConfigSave);
-  server.on("/nodeid",        HTTP_GET,  handleNodeIdPage);
-  server.on("/savenodeid",    HTTP_POST, handleSaveNodeId);
-  server.on("/wifistatus",    HTTP_GET,  handleWiFiStatusPage);
-  server.on("/wsstatus",      HTTP_GET,  handleWSStatusPage);
-  server.on("/resetwifi",     HTTP_GET,  handleResetWiFi);
-  server.on("/restart",       HTTP_GET,  handleRestart);
+  server.on("/",             handleRoot);
+  server.on("/config",       handleConfigPage);
+  server.on("/config-data",  HTTP_GET,  handleConfigData);
+  server.on("/info",         handleInfoPage);
+  server.on("/scan",         HTTP_GET,  handleScan);
+  server.on("/save",         HTTP_POST, handleSave);
+  server.on("/status",       HTTP_GET,  handleStatusJson);
+  server.on("/relay",        HTTP_GET,  handleRelayPage);
+  server.on("/relay/on",     HTTP_GET,  handleRelayOn);
+  server.on("/relay/off",    HTTP_GET,  handleRelayOff);
+  server.on("/relay/config", HTTP_POST, handleRelayConfigSave);
+  server.on("/nodeid",       HTTP_GET,  handleNodeIdPage);
+  server.on("/savenodeid",   HTTP_POST, handleSaveNodeId);
+  server.on("/wifistatus",   HTTP_GET,  handleWiFiStatusPage);
+  server.on("/wsstatus",     HTTP_GET,  handleWSStatusPage);
+  server.on("/resetwifi",    HTTP_GET,  handleResetWiFi);
+  server.on("/restart",      HTTP_GET,  handleRestart);
   server.onNotFound(handleNotFound);
 }
 
@@ -499,10 +538,10 @@ footer{text-align:center;margin-top:28px;color:var(--mu);font-size:10px;letter-s
 </header>
 <main>
   <div class="menu">
-    <a class="lnk" href="/config"><div><div>Configurar Wi-Fi</div><div class="desc">redes e credenciais</div></div><span class="arr">→</span></a>
+    <a class="lnk" href="/config"><div><div>Configurar Wi-Fi</div><div class="desc">redes, credenciais e modo</div></div><span class="arr">→</span></a>
     <a class="lnk" href="/nodeid"><div><div>Node ID</div><div class="desc">identificação do dispositivo</div></div><span class="arr">→</span></a>
     <a class="lnk" href="/info"><div><div>Informações</div><div class="desc">status em tempo real</div></div><span class="arr">→</span></a>
-    <a class="lnk" href="/relay"><div><div>Controle do Relé</div><div class="desc">modo e tipo</div></div><span class="arr">→</span></a>
+    <a class="lnk" href="/relay"><div><div>Controle do Relé</div><div class="desc">modo, tipo e controle manual</div></div><span class="arr">→</span></a>
     <a class="lnk" href="/wifistatus"><div><div>Status Wi-Fi</div><div class="desc">conexão e sinal</div></div><span class="arr">→</span></a>
     <a class="lnk" href="/wsstatus"><div><div>Status WebSocket</div><div class="desc">servidor e backoff</div></div><span class="arr">→</span></a>
     <a class="lnk" href="/resetwifi"><div><div>Reset Credenciais</div><div class="desc">apaga Wi-Fi e reinicia</div></div><span class="arr">→</span></a>
@@ -575,19 +614,23 @@ select option{background:var(--cd)}
   <label>Node ID</label>
   <input id="nodeid" placeholder="ex: C00045">
 
-  <label>Modo do relé</label>
+  <label>Modo da máquina</label>
+  <div class="trow">
+    <div id="btnConv" class="tgl">Convencional<small>0x01 liga / 0x02 desliga</small></div>
+    <div id="btnInd"  class="tgl active">Industrial<small>0x01 = pulso 100ms</small></div>
+  </div>
+
+  <label style="margin-top:14px">Modo do relé</label>
   <div class="trow">
     <div id="modeNormal" class="tgl active">Normal<small>segue WS</small></div>
     <div id="modeOn"     class="tgl">Sempre ON</div>
     <div id="modeOff"    class="tgl">Sempre OFF</div>
   </div>
 
-  <label style="margin-top:14px">Tipo do relé</label>
-  <div class="trow">
-    <div id="typeNA" class="tgl active">NA<small>ON = HIGH</small></div>
-    <div id="typeNF" class="tgl">NF<small>ON = LOW</small></div>
+  <div class="chk">
+    <input id="invert" type="checkbox">
+    <label for="invert">Inverter lógica do relé — ON=LOW (NF)</label>
   </div>
-
   <div class="chk">
     <input id="wsrestart" type="checkbox">
     <label for="wsrestart">Auto-restart se sem WebSocket por 1 hora</label>
@@ -599,17 +642,16 @@ select option{background:var(--cd)}
 </main>
 <script>
 function qs(id){return document.getElementById(id);}
-let relayModeVal=0, relayTypeVal=0;
+let machineModeVal=1, relayModeVal=0;
 
+function setMachineMode(v){
+  machineModeVal=v;
+  ['btnConv','btnInd'].forEach((id,i)=>qs(id).classList.toggle('active',i===v));
+}
 function setRelayMode(v){
   relayModeVal=v;
   ['modeNormal','modeOn','modeOff'].forEach((id,i)=>qs(id).classList.toggle('active',i===v));
 }
-function setRelayType(v){
-  relayTypeVal=v;
-  ['typeNA','typeNF'].forEach((id,i)=>qs(id).classList.toggle('active',i===v));
-}
-
 function encText(e){return['Open','WEP','WPA-PSK','WPA2-PSK','WPA/WPA2'][e]||'?';}
 
 function scan(retry){
@@ -635,19 +677,17 @@ window.onload=()=>{
     qs('ssid2').value=d.ssid2||'';
     qs('pass2').value=d.pass2||'';
     qs('nodeid').value=d.nodeid||'';
+    setMachineMode(d.machineMode!=null?d.machineMode:1);
     setRelayMode(d.relayMode||0);
-    setRelayType(d.relayType||0);
+    qs('invert').checked=(d.relayInvert===1);
     qs('wsrestart').checked=(d.wsrestart===1);
   }).catch(()=>{});
-
   scan();
-
+  qs('btnConv').onclick=()=>setMachineMode(0);
+  qs('btnInd').onclick =()=>setMachineMode(1);
   qs('modeNormal').onclick=()=>setRelayMode(0);
   qs('modeOn').onclick    =()=>setRelayMode(1);
   qs('modeOff').onclick   =()=>setRelayMode(2);
-  qs('typeNA').onclick    =()=>setRelayType(0);
-  qs('typeNF').onclick    =()=>setRelayType(1);
-
   qs('save').onclick=()=>{
     let ss=qs('manual_ssid').value.trim()||qs('ssid').value;
     let id=qs('nodeid').value.trim();
@@ -662,8 +702,9 @@ window.onload=()=>{
            '&ssid2='+encodeURIComponent(qs('ssid2').value.trim()||qs('ssid2_scan').value)+
            '&pass2='+encodeURIComponent(qs('pass2').value)+
            '&nodeid='+encodeURIComponent(id)+
+           '&machineMode='+machineModeVal+
            '&relayMode='+relayModeVal+
-           '&relayType='+relayTypeVal+
+           '&relayInvert='+(qs('invert').checked?1:0)+
            '&wsrestart='+(qs('wsrestart').checked?1:0)
     }).then(r=>r.text()).then(t=>{qs('status').textContent=t;});
   };
@@ -677,14 +718,15 @@ window.onload=()=>{
 // ========== /config-data ==========
 void handleConfigData() {
   String json = "{";
-  json += "\"ssid\":"     + (sSsid.length()  ? "\""+sSsid+"\""  : "\"\"") + ",";
-  json += "\"pass\":"     + (sPass.length()  ? "\""+sPass+"\""  : "\"\"") + ",";
-  json += "\"ssid2\":"    + (sSsid2.length() ? "\""+sSsid2+"\"" : "\"\"") + ",";
-  json += "\"pass2\":"    + (sPass2.length() ? "\""+sPass2+"\"" : "\"\"") + ",";
-  json += "\"nodeid\":\"" + nodeId + "\",";
-  json += "\"relayMode\":" + String(relayMode) + ",";
-  json += "\"relayType\":" + String(relayType) + ",";
-  json += "\"wsrestart\":" + String(wsRestartEnabled ? 1 : 0);
+  json += "\"ssid\":"        + (sSsid.length()  ? "\""+sSsid+"\""  : "\"\"") + ",";
+  json += "\"pass\":"        + (sPass.length()  ? "\""+sPass+"\""  : "\"\"") + ",";
+  json += "\"ssid2\":"       + (sSsid2.length() ? "\""+sSsid2+"\"" : "\"\"") + ",";
+  json += "\"pass2\":"       + (sPass2.length() ? "\""+sPass2+"\"" : "\"\"") + ",";
+  json += "\"nodeid\":\""    + nodeId + "\",";
+  json += "\"machineMode\":" + String((int)machineMode) + ",";
+  json += "\"relayMode\":"   + String(relayMode) + ",";
+  json += "\"relayInvert\":" + String(relayInvert ? 1 : 0) + ",";
+  json += "\"wsrestart\":"   + String(wsRestartEnabled ? 1 : 0);
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -702,20 +744,24 @@ void handleSave() {
   sPass2 = server.arg("pass2");
   nodeId = server.arg("nodeid");
 
-  relayMode        = server.hasArg("relayMode") ? constrain(server.arg("relayMode").toInt(), 0, 2) : 0;
-  relayType        = server.hasArg("relayType") ? constrain(server.arg("relayType").toInt(), 0, 1) : 0;
+  machineMode = server.hasArg("machineMode") ?
+    (MachineMode)constrain(server.arg("machineMode").toInt(), 0, 1) : MODE_INDUSTRIAL;
+  relayMode   = server.hasArg("relayMode") ?
+    constrain(server.arg("relayMode").toInt(), 0, 2) : 0;
+  relayInvert = server.hasArg("relayInvert") && server.arg("relayInvert").toInt() == 1;
   wsRestartEnabled = server.hasArg("wsrestart") && server.arg("wsrestart").toInt() == 1;
   wifiSlot = 0;
 
-  prefs.putString("ssid",      sSsid);
-  prefs.putString("pass",      sPass);
-  prefs.putString("ssid2",     sSsid2);
-  prefs.putString("pass2",     sPass2);
-  prefs.putString("nodeid",    nodeId);
-  prefs.putInt("relayMode",    relayMode);
-  prefs.putInt("relayType",    relayType);
-  prefs.putInt("wsrestart",    wsRestartEnabled ? 1 : 0);
-  prefs.putUInt("bootCount",   bootCount);
+  prefs.putString("ssid",        sSsid);
+  prefs.putString("pass",        sPass);
+  prefs.putString("ssid2",       sSsid2);
+  prefs.putString("pass2",       sPass2);
+  prefs.putString("nodeid",      nodeId);
+  prefs.putInt("machineMode",    (int)machineMode);
+  prefs.putInt("relayMode",      relayMode);
+  prefs.putInt("relayInvert",    relayInvert ? 1 : 0);
+  prefs.putInt("wsrestart",      wsRestartEnabled ? 1 : 0);
+  prefs.putUInt("bootCount",     bootCount);
 
   updateRelayLevels();
   applyRelayOutput();
@@ -729,18 +775,20 @@ void handleSave() {
 void handleStatusJson() {
   bool staOk = (WiFi.status() == WL_CONNECTED);
   String json = "{";
-  json += "\"nodeId\":\""    + nodeId + "\",";
-  json += "\"ssid\":\""      + (staOk ? WiFi.SSID() : String("")) + "\",";
-  json += "\"rssi\":"        + String(staOk ? WiFi.RSSI() : 0) + ",";
-  json += "\"ip_sta\":\""    + (staOk ? WiFi.localIP().toString() : String("")) + "\",";
-  json += "\"ip_ap\":\""     + WiFi.softAPIP().toString() + "\",";
-  json += "\"wsConnected\":" + String(isWebSocketConnected ? "true" : "false") + ",";
-  json += "\"temp\":"        + String(readInternalTempC(), 1) + ",";
-  json += "\"relayOn\":"     + String(isRelayEffectiveOn() ? "true" : "false") + ",";
-  json += "\"relayMode\":"   + String(relayMode) + ",";
-  json += "\"relayType\":"   + String(relayType) + ",";
-  json += "\"wifiSlot\":"    + String(wifiSlot) + ",";
-  json += "\"boots\":"       + String(bootCount);
+  json += "\"nodeId\":\""      + nodeId + "\",";
+  json += "\"ssid\":\""        + (staOk ? WiFi.SSID() : String("")) + "\",";
+  json += "\"rssi\":"          + String(staOk ? WiFi.RSSI() : 0) + ",";
+  json += "\"ip_sta\":\""      + (staOk ? WiFi.localIP().toString() : String("")) + "\",";
+  json += "\"ip_ap\":\""       + WiFi.softAPIP().toString() + "\",";
+  json += "\"wsConnected\":"   + String(isWebSocketConnected ? "true" : "false") + ",";
+  json += "\"temp\":"          + String(readInternalTempC(), 1) + ",";
+  json += "\"relayOn\":"       + String(isRelayEffectiveOn() ? "true" : "false") + ",";
+  json += "\"relayMode\":"     + String(relayMode) + ",";
+  json += "\"relayInvert\":"   + String(relayInvert ? 1 : 0) + ",";
+  json += "\"machineMode\":"   + String((int)machineMode) + ",";
+  json += "\"pulseActive\":"   + String(pulseActive ? "true" : "false") + ",";
+  json += "\"wifiSlot\":"      + String(wifiSlot) + ",";
+  json += "\"boots\":"         + String(bootCount);
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -781,36 +829,41 @@ pre{font-size:11px;background:#060a07;color:#4ade80;padding:10px;border-radius:3
     <div class="it"><div class="lb">IP (STA)</div><div class="vl" id="ip_sta">…</div></div>
     <div class="it"><div class="lb">IP (AP)</div><div class="vl" id="ip_ap">…</div></div>
     <div class="it"><div class="lb">WebSocket</div><div class="vl" id="ws">…</div></div>
+    <div class="it"><div class="lb">Modo Máquina</div><div class="vl" id="machineMode">…</div></div>
     <div class="it"><div class="lb">Relé</div><div class="vl" id="relay">…</div></div>
+    <div class="it"><div class="lb">Pulso</div><div class="vl" id="pulse">…</div></div>
+    <div class="it"><div class="lb">Relay Mode</div><div class="vl" id="relayMode">…</div></div>
+    <div class="it"><div class="lb">Relay Invert</div><div class="vl" id="relayInvert">…</div></div>
     <div class="it"><div class="lb">WiFi Slot</div><div class="vl" id="wifiSlot">…</div></div>
     <div class="it"><div class="lb">Boots</div><div class="vl" id="boots">…</div></div>
-    <div class="it"><div class="lb">Relay Mode</div><div class="vl" id="relayMode">…</div></div>
-    <div class="it"><div class="lb">Relay Type</div><div class="vl" id="relayType">…</div></div>
   </div>
   <div class="nav">
     <a href="/config">← /config</a>
+    <a href="/relay">→ /relay</a>
     <a href="/">← menu</a>
   </div>
   <pre id="raw"></pre>
 </main>
 <script>
 const modeLabel=['Normal','Sempre ON','Sempre OFF'];
-const typeLabel=['NA (ON=HIGH)','NF (ON=LOW)'];
+const mmLabel=['Convencional','Industrial'];
 function upd(){
   fetch('/status').then(r=>r.json()).then(j=>{
-    document.getElementById('nodeId').textContent    = j.nodeId||'—';
-    document.getElementById('ssid').textContent      = j.ssid||'—';
-    document.getElementById('rssi').textContent      = (j.rssi||0)+' dBm';
-    document.getElementById('temp').textContent      = j.temp+'°C';
-    document.getElementById('ip_sta').textContent    = j.ip_sta||'—';
-    document.getElementById('ip_ap').textContent     = j.ip_ap||'—';
-    document.getElementById('ws').textContent        = j.wsConnected ? 'Conectado' : 'Desconectado';
-    document.getElementById('relay').textContent     = j.relayOn ? 'ON' : 'OFF';
-    document.getElementById('wifiSlot').textContent  = 'Slot '+(j.wifiSlot+1);
-    document.getElementById('boots').textContent     = j.boots;
-    document.getElementById('relayMode').textContent = modeLabel[j.relayMode]||j.relayMode;
-    document.getElementById('relayType').textContent = typeLabel[j.relayType]||j.relayType;
-    document.getElementById('raw').textContent       = JSON.stringify(j,null,2);
+    document.getElementById('nodeId').textContent     = j.nodeId||'—';
+    document.getElementById('ssid').textContent       = j.ssid||'—';
+    document.getElementById('rssi').textContent       = (j.rssi||0)+' dBm';
+    document.getElementById('temp').textContent       = j.temp+'°C';
+    document.getElementById('ip_sta').textContent     = j.ip_sta||'—';
+    document.getElementById('ip_ap').textContent      = j.ip_ap||'—';
+    document.getElementById('ws').textContent         = j.wsConnected ? 'Conectado' : 'Desconectado';
+    document.getElementById('machineMode').textContent= mmLabel[j.machineMode]||j.machineMode;
+    document.getElementById('relay').textContent      = j.relayOn ? 'ON' : 'OFF';
+    document.getElementById('pulse').textContent      = j.pulseActive ? 'ATIVO' : 'inativo';
+    document.getElementById('relayMode').textContent  = modeLabel[j.relayMode]||j.relayMode;
+    document.getElementById('relayInvert').textContent= j.relayInvert ? 'SIM (NF)' : 'NÃO (NA)';
+    document.getElementById('wifiSlot').textContent   = 'Slot '+(j.wifiSlot+1);
+    document.getElementById('boots').textContent      = j.boots;
+    document.getElementById('raw').textContent        = JSON.stringify(j,null,2);
   });
 }
 setInterval(upd,3000); upd();
@@ -839,7 +892,6 @@ void handleScan() {
   }
   json += "]";
   WiFi.scanDelete();
-  // Inicia novo scan em background para próxima chamada
   WiFi.scanNetworks(true);
   server.send(200, "application/json", json);
 }
@@ -851,7 +903,7 @@ void handleRelayPage() {
 <html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Foreasy — Relé</title>
 <style>
-:root{--bg:#0a0e0b;--cd:#111814;--bd:#1e3028;--ac:#00e676;--ac2:#009e55;--tx:#d4f5e0;--mu:#557060;--lb:#4ade80;--ip:#0d1710;--red:#f87171;--red2:#b91c1c}
+:root{--bg:#0a0e0b;--cd:#111814;--bd:#1e3028;--ac:#00e676;--ac2:#009e55;--tx:#d4f5e0;--mu:#557060;--lb:#4ade80;--ip:#0d1710;--red:#f87171}
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--tx);font-family:ui-monospace,'Cascadia Code','SF Mono',monospace;font-size:13px}
 header{background:var(--cd);border-bottom:1px solid var(--bd);padding:14px 20px}
@@ -862,9 +914,11 @@ main{max-width:480px;margin:0 auto;padding:18px 16px 32px}
 .state{background:var(--cd);border:1px solid var(--bd);border-radius:3px;padding:14px 16px;margin-bottom:4px;display:flex;align-items:center;justify-content:space-between}
 .state-lbl{color:var(--mu);font-size:10px;letter-spacing:1px;text-transform:uppercase}
 .state-val{font-size:20px;font-weight:700;color:var(--ac)}
+.trow{display:flex;gap:8px;margin-top:8px}
+.tgl{flex:1;padding:11px 8px;border:1px solid var(--bd);border-radius:3px;cursor:pointer;text-align:center;background:var(--cd);color:var(--mu);font-size:12px;transition:all .15s;line-height:1.4}
+.tgl.active{background:#003d1a;border-color:var(--ac);color:var(--ac);font-weight:700}
+.tgl small{display:block;font-size:10px;opacity:.7;margin-top:2px}
 label{color:var(--mu);font-size:10px;letter-spacing:1px;text-transform:uppercase;display:block;margin:12px 0 4px}
-select{width:100%;background:var(--ip);color:var(--tx);border:1px solid var(--bd);border-radius:3px;padding:10px 12px;font-family:inherit;font-size:13px;outline:none}
-select option{background:var(--cd)}
 .chk{display:flex;align-items:center;gap:10px;margin-top:10px;padding:10px 12px;border:1px solid var(--bd);border-radius:3px;background:var(--cd)}
 .chk input[type=checkbox]{width:15px;height:15px;accent-color:var(--ac);flex-shrink:0}
 .chk span{font-size:12px;color:var(--tx)}
@@ -888,54 +942,75 @@ select option{background:var(--cd)}
 </header>
 <main>
   <div class="state">
-    <div><div class="state-lbl">Estado atual</div></div>
+    <div><div class="state-lbl">Estado atual</div><div class="state-lbl" id="mmLabel" style="margin-top:4px"></div></div>
     <div class="state-val" id="relayState">…</div>
   </div>
 
-  <div class="sec">Configuração</div>
-  <label>Modo do relé</label>
-  <select id="relayMode">
-    <option value="0">Normal — segue WebSocket</option>
-    <option value="1">Sempre ON</option>
-    <option value="2">Sempre OFF</option>
-  </select>
+  <div class="sec">Modo da máquina</div>
+  <div class="trow">
+    <div id="btnConv" class="tgl">Convencional<small>0x01 liga / 0x02 desliga</small></div>
+    <div id="btnInd"  class="tgl active">Industrial<small>0x01 = pulso 100ms</small></div>
+  </div>
 
-  <label style="margin-top:14px">Tipo do relé</label>
-  <div class="chk"><input type="checkbox" id="relayNA"><span>Normalmente Aberto (NA) — ON=HIGH</span></div>
-  <div class="chk"><input type="checkbox" id="relayNF"><span>Normalmente Fechado (NF) — ON=LOW</span></div>
+  <div class="sec">Configuração do relé</div>
+  <label>Modo do relé</label>
+  <div class="trow">
+    <div id="modeNormal" class="tgl active">Normal<small>segue WS</small></div>
+    <div id="modeOn"     class="tgl">Sempre ON</div>
+    <div id="modeOff"    class="tgl">Sempre OFF</div>
+  </div>
+
+  <div class="chk" style="margin-top:12px">
+    <input type="checkbox" id="invert">
+    <span>Inverter lógica — ON=LOW (NF, Normalmente Fechado)</span>
+  </div>
 
   <button class="btn btn-save" id="saveCfg">Salvar Configuração</button>
   <div class="st" id="cfgStatus"></div>
 
   <div class="sec">Controle manual</div>
   <div class="btn-row">
-    <button class="btn btn-on"  id="btnOn">Ligar</button>
+    <button class="btn btn-on"  id="btnOn">Ligar / Pulso</button>
     <button class="btn btn-off" id="btnOff">Desligar</button>
   </div>
-  <div class="note">Em modo <b>Sempre ON</b> ou <b>Sempre OFF</b> os comandos do WebSocket e os botões acima são ignorados.</div>
+  <div class="note">Em <b>Sempre ON/OFF</b>: WS e botões ignorados.<br>Em <b>Industrial</b>: "Ligar" dispara pulso de 100ms.</div>
 
   <div class="nav"><a href="/">← menu</a></div>
 </main>
 <script>
 function qs(id){return document.getElementById(id);}
+let machineModeVal=1, relayModeVal=0;
+
+function setMachineMode(v){
+  machineModeVal=v;
+  ['btnConv','btnInd'].forEach((id,i)=>qs(id).classList.toggle('active',i===v));
+}
+function setRelayMode(v){
+  relayModeVal=v;
+  ['modeNormal','modeOn','modeOff'].forEach((id,i)=>qs(id).classList.toggle('active',i===v));
+}
+
 function loadStatus(){
   fetch('/status').then(r=>r.json()).then(j=>{
     qs('relayState').textContent = j.relayOn ? 'ON' : 'OFF';
     qs('relayState').style.color = j.relayOn ? '#00e676' : '#f87171';
-    qs('relayMode').value = j.relayMode!=null ? j.relayMode : 0;
-    let t = j.relayType!=null ? j.relayType : 0;
-    qs('relayNA').checked=(t===0); qs('relayNF').checked=(t===1);
+    qs('mmLabel').textContent    = j.machineMode===1 ? 'Industrial' : 'Convencional';
+    setMachineMode(j.machineMode!=null?j.machineMode:1);
+    setRelayMode(j.relayMode||0);
+    qs('invert').checked=(j.relayInvert===1);
   });
 }
 window.onload=()=>{
   loadStatus();
-  qs('relayNA').onchange=()=>{if(qs('relayNA').checked)qs('relayNF').checked=false;};
-  qs('relayNF').onchange=()=>{if(qs('relayNF').checked)qs('relayNA').checked=false;};
+  qs('btnConv').onclick   = ()=>setMachineMode(0);
+  qs('btnInd').onclick    = ()=>setMachineMode(1);
+  qs('modeNormal').onclick= ()=>setRelayMode(0);
+  qs('modeOn').onclick    = ()=>setRelayMode(1);
+  qs('modeOff').onclick   = ()=>setRelayMode(2);
   qs('saveCfg').onclick=()=>{
-    let mode=qs('relayMode').value, type=qs('relayNF').checked?1:0;
     qs('cfgStatus').textContent='Salvando...';
     fetch('/relay/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:'mode='+mode+'&type='+type})
+      body:'machineMode='+machineModeVal+'&mode='+relayModeVal+'&invert='+(qs('invert').checked?1:0)})
     .then(r=>r.text()).then(t=>{qs('cfgStatus').textContent=t;loadStatus();});
   };
   qs('btnOn').onclick =()=>fetch('/relay/on').then(()=>loadStatus());
@@ -949,28 +1024,49 @@ window.onload=()=>{
 
 void handleRelayOn() {
   if (relayMode != 0) { server.send(200, "text/plain", "Modo fixo ativo, comando ignorado."); return; }
-  relayLogicalOn = true;
-  applyRelayOutput();
-  if (isWebSocketConnected) webSocket.sendTXT("RelayStatus:ON");
-  server.send(200, "text/plain", "Relay ON");
+  if (machineMode == MODE_INDUSTRIAL) {
+    if (!pulseActive) {
+      pulseActive = true;
+      pulseEndMs  = millis() + PULSE_MS;
+      applyRelayOutput();
+    }
+    if (isWebSocketConnected) webSocket.sendTXT("RelayStatus:ON");
+    server.send(200, "text/plain", "Pulso iniciado");
+  } else {
+    relayLogicalOn = true;
+    applyRelayOutput();
+    if (isWebSocketConnected) webSocket.sendTXT("RelayStatus:ON");
+    server.send(200, "text/plain", "Relay ON");
+  }
 }
 
 void handleRelayOff() {
   if (relayMode != 0) { server.send(200, "text/plain", "Modo fixo ativo, comando ignorado."); return; }
-  relayLogicalOn = false;
-  applyRelayOutput();
+  if (machineMode == MODE_INDUSTRIAL) {
+    pulseActive = false;
+    applyRelayOutput();
+  } else {
+    relayLogicalOn = false;
+    applyRelayOutput();
+  }
   if (isWebSocketConnected) webSocket.sendTXT("RelayStatus:OFF");
   server.send(200, "text/plain", "Relay OFF");
 }
 
 void handleRelayConfigSave() {
+  if (server.hasArg("machineMode")) {
+    machineMode = (MachineMode)constrain(server.arg("machineMode").toInt(), 0, 1);
+    prefs.putInt("machineMode", (int)machineMode);
+    pulseActive = false;
+    applyRelayOutput();
+  }
   if (server.hasArg("mode")) {
     relayMode = constrain(server.arg("mode").toInt(), 0, 2);
     prefs.putInt("relayMode", relayMode);
   }
-  if (server.hasArg("type")) {
-    relayType = constrain(server.arg("type").toInt(), 0, 1);
-    prefs.putInt("relayType", relayType);
+  if (server.hasArg("invert")) {
+    relayInvert = (server.arg("invert").toInt() == 1);
+    prefs.putInt("relayInvert", relayInvert ? 1 : 0);
   }
   updateRelayLevels();
   applyRelayOutput();
@@ -1077,6 +1173,7 @@ void handleWiFiStatusPage() {
 
 // ========== /wsstatus ==========
 void handleWSStatusPage() {
+  const char* mmStr = machineMode == MODE_INDUSTRIAL ? "Industrial" : "Convencional";
   String html =
     "<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>Foreasy WS</title>"
@@ -1100,6 +1197,7 @@ void handleWSStatusPage() {
     "<div class='it'><span class='lbl'>Conectado</span><span class='vl'>" + String(isWebSocketConnected ? "SIM" : "NÃO") + "</span></div>"
     "<div class='it'><span class='lbl'>Servidor</span><span class='vl'>" + String(wsHost) + "</span></div>"
     "<div class='it'><span class='lbl'>Backoff atual</span><span class='vl'>" + String(wsNextRetryMs) + " ms</span></div>"
+    "<div class='it'><span class='lbl'>Modo máquina</span><span class='vl'>" + String(mmStr) + "</span></div>"
     "<div class='it'><span class='lbl'>Auto-restart</span><span class='vl'>" + String(wsRestartEnabled ? "SIM" : "NÃO") + "</span></div>"
     "<div class='nav'><a href='/'>← menu</a></div>"
     "</main></body></html>";
@@ -1108,11 +1206,11 @@ void handleWSStatusPage() {
 
 // ========== /resetwifi ==========
 void handleResetWiFi() {
-  prefs.remove("ssid");      prefs.remove("pass");
-  prefs.remove("ssid2");     prefs.remove("pass2");
-  prefs.remove("nodeid");    prefs.remove("relayMode");
-  prefs.remove("relayType"); prefs.remove("wsrestart");
-  prefs.remove("bootCount");
+  prefs.remove("ssid");        prefs.remove("pass");
+  prefs.remove("ssid2");       prefs.remove("pass2");
+  prefs.remove("nodeid");      prefs.remove("machineMode");
+  prefs.remove("relayMode");   prefs.remove("relayInvert");
+  prefs.remove("wsrestart");   prefs.remove("bootCount");
   server.send(200, "text/plain", "Credenciais removidas. Reiniciando...");
   delay(400);
   ESP.restart();

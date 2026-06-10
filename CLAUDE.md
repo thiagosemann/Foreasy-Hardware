@@ -117,7 +117,7 @@ uint8_t OFF_CMD[] = {0xA0, 0x01, 0x00, 0xA1};  // Relay OFF
 |---------|----------|-----------|
 | `Foreasy-Hardware-Serial/Foreasy-Hardware-Serial.ino` | Modelos 1 e 5 | ESP-01S + shield serial (STC15F104W) — **firmware principal ESP8266** |
 | `Foreasy-Hardware/Foreasy-Hardware.ino` | Modelo 2 | ESP-01S + shield GPIO V1 — relay via GPIO0 direto |
-| `Foreasy-Hardware-ESP32/esp32.ino` | Modelos 3 e 4 | ESP32 + shield relé 30A (com ou sem SSR) |
+| `ESP32/esp32/esp32.ino` | Modelos 3 e 4 | ESP32 + shield relé 30A (com ou sem SSR) |
 
 ---
 
@@ -156,10 +156,10 @@ uint8_t OFF_CMD[] = {0xA0, 0x01, 0x00, 0xA1};  // Relay OFF
 **Relay controlado via GPIO2; LED em GPIO4**
 
 - Usa **Preferences (NVS)** — `prefs.begin("wifi", false)`; credenciais cacheadas em Strings no boot
-- **Sem machineMode** — firmware puramente relay ON/OFF (sem pulso Speed Queen)
-- `relayMode`: `0`=Normal (segue WS), `1`=Sempre ON, `2`=Sempre OFF
-- `relayType`: `0`=NA (ON=HIGH), `1`=NF (ON=LOW) — salvo individualmente via `/relay/config`
-- Em modo Sempre ON/OFF: comandos WS e botões locais são ignorados
+- `machineMode`: `0`=Convencional (0x01=Relay ON / 0x02=Relay OFF) | `1`=Industrial (0x01=pulso de `PULSE_MS` 100ms, 0x02 ignorado)
+- `relayMode`: `0`=Normal (segue WS/machineMode), `1`=Sempre ON, `2`=Sempre OFF
+- `relayInvert`: `false`=normal (ON=HIGH/OFF=LOW), `true`=invertido (ON=LOW/OFF=HIGH) — útil para relay NF
+- Em modo Sempre ON/OFF: comandos WS, machineMode e botões locais são ignorados
 - **Dual WiFi com failover** (ssid/ssid2) — alterna sem restart, `wifiSlot` rastreado
 - **WiFi não-bloqueante**: `wifiTick()` com timeout de 40s, retry a cada 5s — **sem apagar credenciais por falha de conexão**
 - **WS backoff exponencial**: 10s base → 120s máx
@@ -168,8 +168,8 @@ uint8_t OFF_CMD[] = {0xA0, 0x01, 0x00, 0xA1};  // Relay OFF
 - **WS zombie**: detecta ausência de ping/pong por 5min e reconecta
 - App ping a cada 30s; `webSocket.enableHeartbeat(15000, 3000, 2)`
 - Ao conectar WS: envia `"ID:<nodeId>"` se relay ON, `"NID:<nodeId>"` se OFF
-- Comando `0x03` responde JSON: `rssi, heap, uptime, boots, wifiSlot, temp`
-- Lê temperatura interna (`temprature_sens_read()`)
+- Comando `0x03` responde JSON: `rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, temp, machineMode, pulse`
+- Lê temperatura interna (`temperatureRead()`)
 - `bootCount` incrementado em RAM; salvo em Preferences apenas no `/save`
 - Scan WiFi **assíncrono** (`WiFi.scanNetworks(true)`)
 - `/config-data` endpoint JSON separado da página HTML
@@ -187,10 +187,11 @@ uint8_t OFF_CMD[] = {0xA0, 0x01, 0x00, 0xA1};  // Relay OFF
 
 ### Protocolo WebSocket (binário) — ESP32 (Modelos 3, 4)
 
-| Byte | Ação |
-|------|------|
-| 0x01 | Relay ON (se relayMode=Normal) |
-| 0x02 | Relay OFF (se relayMode=Normal) |
+| Byte | Modo Convencional | Modo Industrial |
+|------|--------------------|------------------|
+| 0x01 | Relay ON (se relayMode=Normal) | Pulso relay (`PULSE_MS`=100ms, se relayMode=Normal) |
+| 0x02 | Relay OFF (se relayMode=Normal) | Ignorado |
+| 0x03 | Responde JSON: `rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, temp, machineMode, pulse` | idem |
 
 Resposta sempre: `"RelayStatus:ON"` ou `"RelayStatus:OFF"`
 
