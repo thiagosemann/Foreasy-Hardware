@@ -46,18 +46,30 @@ Integração com a Speed Queen via conector H3/H5: envio de pulso de crédito pa
 #### Mapeamento por função (schematic 807300 — H3)
 | Pino H3 | Label ALPM | Função |
 |---------|------------|--------|
-| H3-7   | START IN   | START PULSE IN — ânodo do optoacoplador (4N25 + 100Ω interno) |
-| H3-5   | —          | START PULSE (2ª entrada paralela ou retorno, com 100Ω) |
-| H3-4   | AVAIL OUT  | AVAILABLE OUTPUT — coletor aberto TLP781 |
-| H3-3   | +5V        | EXTERNAL 5VDC — alimentação fornecida pela máquina |
+| H3-7   | START IN   | START PULSE IN — cátodo do optoacoplador H11L1 (100Ω interno) |
+| H3-6   | —          | START PULSE (2ª entrada paralela, com 100Ω interno) |
+| H3-5   | AVAIL EMIT | AVAILABLE OUTPUT — emissor do 4N25 (conectar ao GND/H3-2) |
+| H3-4   | AVAIL COL  | AVAILABLE OUTPUT — coletor do 4N25 (pull-up externo aqui) |
+| H3-3   | +5V        | EXTERNAL 5VDC — alimentação fornecida pela máquina (20mA) |
 | H3-2   | COM        | EXTERNAL COMMON — GND de referência |
 | H3-1   | TxD        | SCI TxD OUT — serial da máquina (4.5–5.5VDC, 5mA) |
+| H3-8   | —          | UNUSED |
+
+> **Componentes confirmados pelo schematic:** START PULSE usa optoacoplador **H11L1**; AVAIL OUT usa optoacoplador **4N25** com coletor (H3-4) e emissor (H3-5) expostos separadamente.
 
 ### Especificações elétricas (schematic 807300 + ALPM-39201)
 - **START IN**: 3–30mA, **mínimo 20ms** (schematic 807300); ALPM diz 45ms — usar 100ms no firmware é seguro
-- **AVAIL OUT**: Vmax 28VDC, Imax 5mA — pull-up externo 10kΩ para 3.3V
+- **AVAIL OUT**: Vmax 28VDC, Imax 5mA — pull-up externo 10kΩ em H3-4 (COL); H3-5 (EMIT) → GND (H3-2)
 - Circuito de pulso: `+5V (H3-3) → 150Ω externo → H3-7 (START IN)` | `H3-2 → GND do shield`
   - Cálculo: ~5V / (100Ω interno + 150Ω externo) ≈ 14mA — dentro de 3–30mA ✓
+
+### Como medir AVAIL OUT com osciloscópio
+```
+H3-3 (+5V) ── 10kΩ ──┬── CH1 osciloscópio
+                      |
+                    H3-4 (AVAIL COL — 4N25)
+                    H3-5 (AVAIL EMIT) ── H3-2 (COM/GND) ── GND osciloscópio
+```
 
 ### Polaridade do AVAIL OUT — IMPORTANTE
 O schematic 807300 indica **"ON = AVAILABLE"** — o transistor conduz quando a máquina está **livre**:
