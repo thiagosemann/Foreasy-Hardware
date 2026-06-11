@@ -115,11 +115,38 @@ uint8_t OFF_CMD[] = {0xA0, 0x01, 0x00, 0xA1};  // Relay OFF
 ### Arquivos
 | Arquivo | Hardware | Descrição |
 |---------|----------|-----------|
-| `Foreasy-Hardware-Serial/Foreasy-Hardware-Serial.ino` | Modelos 1 e 5 | ESP-01S + shield serial (STC15F104W) — **firmware principal ESP8266** |
-| `Foreasy-Hardware/Foreasy-Hardware.ino` | Modelo 2 | ESP-01S + shield GPIO V1 — relay via GPIO0 direto |
+| `ESP32-S3/esp32s3/esp32s3.ino` | ESP32-S3 | **Firmware principal / centralizado** — Industrial (pulso START) + Convencional (relé); pinos e servidor configuráveis via wizard |
+| `ESP8266/industrial_serial/industrial_serial.ino` | Modelos 1 e 5 | ESP-01S + shield serial (STC15F104W) — firmware principal ESP8266 |
+| `ESP8266/industrial_sem_serial/industrial_sem_serial.ino` | Modelo 2 | ESP-01S + shield GPIO V1 — relay via GPIO0 direto |
 | `ESP32/esp32/esp32.ino` | Modelos 3 e 4 | ESP32 + shield relé 30A (com ou sem SSR) |
+| `ESP32-AVAIL/esp32_avail/esp32_avail.ino` | Protótipo de bancada | Teste de AVAIL OUT + pulso START IN (AP próprio, sem WiFi STA/WS) |
 
 ---
+
+### ESP32-S3 — `esp32s3.ino` (firmware principal / centralizado)
+
+Firmware unificado para onde estamos migrando Industrial + Convencional.
+
+> **Nomenclatura (atenção):** no firmware, `machineMode` segue a convenção dos outros ESPs — **Industrial (1) = pulso**, **Convencional (0) = relé ON/OFF** — que é o *inverso* da descrição conceitual em "Modelos de Sistema". Aqui vale a do firmware.
+
+**Modos (alternáveis — `relayMode` Sempre ON/OFF foi removido):**
+- **Industrial** (`machineMode=1`, padrão): **não usa relé**. Dá pulso de `PULSE_MS` (100ms) no `startPin` direto no optoacoplador START IN (Speed Queen H3-7), ativo HIGH — mesma técnica do `esp32_avail.ino`. WS `0x01` dispara o pulso; `0x02` ignorado.
+- **Convencional** (`machineMode=0`): relé ON/OFF no `relayPin`. WS `0x01`=ON, `0x02`=OFF. `relayType`: `0`=NA (ON=HIGH) / `1`=NF (ON=LOW).
+
+**AVAIL OUT (leitura):** `availPin` em `INPUT_PULLUP` com debounce 50ms (`readAvailTick()` no loop). LOW=livre, HIGH=ocupada. Exposto em `/status` e `/info`. **Ainda só leitura — não controla nada.**
+
+**Pinos e servidor configuráveis (persistidos na NVS, aplicados no boot):**
+- Pinos default: `relayPin`=GPIO2, `startPin`=GPIO5, `availPin`=GPIO6, `ledPin`=GPIO4 (fixo)
+- Servidor WebSocket (`wsHost`/`wsPort`) editável pelo wizard — default `frst-back-...herokuapp.com:80`
+
+**Páginas web (somente duas):**
+- `/config` — wizard step-by-step (Rede → Servidor → Modo → Pinos), self-contained e mobile
+- `/info` — status com auto-refresh 2s (inclui AVAIL, pinos, servidor)
+- `/` redireciona para `/config`. Endpoints de apoio: `/config-data`, `/save`, `/scan`, `/status`, `/resetwifi` (= `prefs.clear()`), `/restart`
+
+**Armazenamento (NVS namespace `wifi`):** `ssid`, `pass`, `ssid2`, `pass2`, `nodeid`, `machineMode`, `relayType`, `wsHost`, `wsPort`, `relayPin`, `startPin`, `availPin`, `wsrestart`, `bootCount`
+
+**Reutiliza do ESP32 (Modelos 3/4):** dual WiFi + failover sem restart, WiFi não-bloqueante, WS backoff 10s→120s, watchdogs (WS >5min / global >8min), WS zombie, `wsRestartEnabled`, temperatura interna, scan WiFi async. Protocolo WS idêntico ao ESP32.
 
 ### Modelos 1 e 5 — `Foreasy-Hardware-Serial.ino`
 
@@ -195,6 +222,18 @@ uint8_t OFF_CMD[] = {0xA0, 0x01, 0x00, 0xA1};  // Relay OFF
 
 Resposta sempre: `"RelayStatus:ON"` ou `"RelayStatus:OFF"`
 
+### Protocolo WebSocket (binário) — ESP32-S3
+
+Mesmos bytes do ESP32, com duas diferenças: **não há `relayMode`** (Sempre ON/OFF removido) e no **Industrial o pulso sai pelo `startPin` (GPIO START IN), não pelo relé**.
+
+| Byte | Modo Convencional | Modo Industrial |
+|------|--------------------|------------------|
+| 0x01 | Relay ON | Pulso no START IN (`PULSE_MS`=100ms) |
+| 0x02 | Relay OFF | Ignorado |
+| 0x03 | Responde JSON: `rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, temp, machineMode, pulse` | idem |
+
+Resposta sempre: `"RelayStatus:ON"` ou `"RelayStatus:OFF"`
+
 ---
 
 ## Configuração da Máquina Speed Queen (MDC)
@@ -217,11 +256,12 @@ Resposta sempre: `"RelayStatus:ON"` ou `"RelayStatus:OFF"`
 
 ## Próximos Passos
 
+- [x] Leitura do AVAIL OUT implementada no ESP32-S3 (`availPin`, INPUT_PULLUP, debounce) — **só leitura, ainda não usada para controle**
 - [ ] Configurar PLSNod = 1 na máquina
-- [ ] Confirmar AVAIL OUT com pull-up 10kΩ → 3.3V
-- [ ] Implementar leitura de status via GPIO3 (após Serial.end()) ou placa com mais GPIOs
-- [ ] Validar lógica: pulso → confirma AVAIL OUT → sucesso/retry
-- [ ] Definir shield definitivo (ESP8266MOD + GPIOs expostos)
+- [ ] Confirmar AVAIL OUT com pull-up 10kΩ → 3.3V (validar nível real no ESP32-S3)
+- [ ] Usar o AVAIL no controle: pulso → confirma AVAIL OUT (LOW→HIGH ~500ms) → sucesso/retry
+- [ ] Definir shield definitivo do ESP32-S3 (GPIOs de relay/start/avail expostos)
+- [ ] (ESP8266) leitura de status via GPIO3 após `Serial.end()` ou placa com mais GPIOs
 
 ### Arquitetura alvo
 ```
