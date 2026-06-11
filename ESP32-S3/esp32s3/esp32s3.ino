@@ -28,7 +28,13 @@
 // PROTOCOLO WEBSOCKET (binário):
 // - 0x01 => INDUSTRIAL: pulso START IN 100ms | CONVENCIONAL: Relé ON
 // - 0x02 => INDUSTRIAL: ignorado             | CONVENCIONAL: Relé OFF
-// - 0x03 => JSON: rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, temp, machineMode, pulse
+// - 0x03 => JSON: rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, temp, machineMode, pulse, fw
+// - 0x04 => OTA: payload = 0x04 + "url|sha256" (sha256 opcional, 64 hex). Baixa o .bin,
+//           grava com Update, valida SHA256 e reinicia. Respostas async:
+//           "OTA:QUEUED" → "OTA:START" → "OTA:OK:restart" | "OTA:FAIL:<motivo>"
+// - 0x05 => JSON status do AVAIL: {"type":"avail","livre":bool,"raw":-1/0/1,
+//           "sinceMs":ms,"availEn":0/1,"machineMode":0/1}
+// - 0x06 => Restart remoto. Responde "Restarting" e reinicia após ~300ms.
 //
 // WIFI:
 // - Dual WiFi com failover automático entre rede 1 e rede 2 (sem restart)
@@ -63,6 +69,12 @@
 #include <WebServer.h>
 #include <WebSocketsClient.h>
 #include <Preferences.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Update.h>
+#include <mbedtls/sha256.h>
+
+#define FW_VERSION "1.0.0"   // reportado no 0x03 para auditoria da frota (ver PLANO-NOVA-VERSAO.md §1.6)
 
 float readInternalTempC() {
   return temperatureRead();
@@ -167,6 +179,16 @@ bool wsRestartEnabled = false;
 
 // ---------- Boot count ----------
 uint32_t bootCount = 0;
+
+// ---------- OTA (requisição enfileirada; executa em otaTick, fora do callback WS) ----------
+bool   otaRequested = false;
+bool   otaInProgress = false;
+String otaPendingUrl;
+String otaPendingSha;
+
+// ---------- Restart remoto (enfileirado; executa em restartTick, fora do callback WS) ----------
+bool     restartRequested = false;
+uint32_t restartAtMs      = 0;
 
 // ================= RELAY HELPERS =================
 void updateRelayLevels() {
@@ -374,6 +396,130 @@ void connectToWebSocket() {
   Serial.printf("WS begin: %s:%u\n", wsHost.c_str(), wsPort);
 }
 
+// ================= OTA (Over-The-Air) =================
+// Esboço do PLANO-NOVA-VERSAO.md §1.5: baixa o .bin, grava com Update, valida SHA256, reinicia.
+// Bloqueante por natureza — por isso roda em otaTick() (loop), nunca dentro do callback WS.
+void otaReport(const String& s) {
+  Serial.println(s);
+  if (isWebSocketConnected) webSocket.sendTXT(s);
+}
+
+bool doOTA(const String& url, const String& expectedSha) {
+  if (WiFi.status() != WL_CONNECTED) { otaReport("OTA:FAIL:nowifi"); return false; }
+  if (url.length() == 0)             { otaReport("OTA:FAIL:nourl");  return false; }
+
+  otaInProgress = true;
+  otaReport("OTA:START");
+
+  // HTTP (plain) ou HTTPS conforme a URL. setInsecure: sem pinning (ver §1.6 p/ endurecer).
+  bool https = url.startsWith("https");
+  WiFiClient       plainClient;
+  WiFiClientSecure secureClient;
+  if (https) secureClient.setInsecure();
+  WiFiClient* netClient = https ? (WiFiClient*)&secureClient : &plainClient;
+
+  HTTPClient http;
+  http.setTimeout(15000);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);  // GitHub/R2 redirecionam p/ outro host
+  if (!http.begin(*netClient, url)) { otaReport("OTA:FAIL:begin"); otaInProgress = false; return false; }
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    otaReport("OTA:FAIL:http" + String(code));
+    http.end(); otaInProgress = false; return false;
+  }
+
+  int len = http.getSize();
+  if (len <= 0) { otaReport("OTA:FAIL:len"); http.end(); otaInProgress = false; return false; }
+
+  if (!Update.begin(len)) {
+    otaReport("OTA:FAIL:space" + String(Update.getError()));
+    http.end(); otaInProgress = false; return false;
+  }
+
+  bool verify = (expectedSha.length() == 64);
+  mbedtls_sha256_context shaCtx;
+  if (verify) { mbedtls_sha256_init(&shaCtx); mbedtls_sha256_starts(&shaCtx, 0); }
+
+  WiFiClient* stream = http.getStreamPtr();
+  uint8_t buf[1024];
+  int remaining = len;
+  uint32_t lastDataMs = millis();
+
+  while (http.connected() && remaining > 0) {
+    size_t avail = stream->available();
+    if (avail) {
+      int toRead = (avail > sizeof(buf)) ? sizeof(buf) : (int)avail;
+      int n = stream->readBytes(buf, toRead);
+      if (n <= 0) break;
+      if (verify) mbedtls_sha256_update(&shaCtx, buf, n);
+      if (Update.write(buf, (size_t)n) != (size_t)n) {
+        if (verify) mbedtls_sha256_free(&shaCtx);
+        Update.abort();
+        otaReport("OTA:FAIL:write" + String(Update.getError()));
+        http.end(); otaInProgress = false; return false;
+      }
+      remaining -= n;
+      lastDataMs = millis();
+    } else {
+      if ((millis() - lastDataMs) > 15000) {   // stream travou
+        if (verify) mbedtls_sha256_free(&shaCtx);
+        Update.abort();
+        otaReport("OTA:FAIL:timeout");
+        http.end(); otaInProgress = false; return false;
+      }
+      delay(1);
+    }
+  }
+
+  if (remaining != 0) {
+    if (verify) mbedtls_sha256_free(&shaCtx);
+    Update.abort();
+    otaReport("OTA:FAIL:incomplete");
+    http.end(); otaInProgress = false; return false;
+  }
+
+  if (verify) {
+    uint8_t hash[32];
+    mbedtls_sha256_finish(&shaCtx, hash);
+    mbedtls_sha256_free(&shaCtx);
+    char hex[65];
+    for (int i = 0; i < 32; i++) sprintf(hex + i * 2, "%02x", hash[i]);
+    if (!expectedSha.equalsIgnoreCase(hex)) {
+      Update.abort();
+      otaReport("OTA:FAIL:sha");
+      http.end(); otaInProgress = false; return false;
+    }
+  }
+
+  if (!Update.end(true)) {
+    otaReport("OTA:FAIL:end" + String(Update.getError()));
+    http.end(); otaInProgress = false; return false;
+  }
+
+  http.end();
+  otaReport("OTA:OK:restart");
+  delay(300);
+  ESP.restart();
+  return true;   // não retorna (reiniciou)
+}
+
+// Executado no loop: dispara o OTA pendente fora do contexto do callback WS.
+void otaTick() {
+  if (!otaRequested) return;
+  otaRequested = false;
+  doOTA(otaPendingUrl, otaPendingSha);
+  otaInProgress = false;   // só chega aqui se o OTA falhou (sucesso reinicia)
+}
+
+// Executado no loop: reinicia após o WS 0x06, dando tempo da resposta "Restarting" sair.
+void restartTick() {
+  if (!restartRequested) return;
+  if ((int32_t)(millis() - restartAtMs) < 0) return;
+  Serial.println("WS 0x06: restart remoto.");
+  ESP.restart();
+}
+
 // ================= WS EVENT =================
 void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
@@ -411,11 +557,11 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 
         if (b == 0x03) {
           bool staOk = (WiFi.status() == WL_CONNECTED);
-          char buf[280];
+          char buf[320];
           snprintf(buf, sizeof(buf),
             "{\"rssi\":%d,\"ch\":%d,\"heap\":%u,\"block\":%u,\"cpu\":%u,"
             "\"uptime\":%lu,\"boots\":%lu,\"wifiSlot\":%u,\"temp\":%.1f,"
-            "\"machineMode\":%u,\"pulse\":%s}",
+            "\"machineMode\":%u,\"pulse\":%s,\"fw\":\"%s\"}",
             staOk ? WiFi.RSSI() : 0,
             staOk ? (int)WiFi.channel() : 0,
             (unsigned)ESP.getFreeHeap(),
@@ -426,7 +572,51 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             (unsigned)wifiSlot,
             readInternalTempC(),
             (unsigned)machineMode,
-            pulseActive ? "true" : "false"
+            pulseActive ? "true" : "false",
+            FW_VERSION
+          );
+          webSocket.sendTXT(buf);
+          break;
+        }
+
+        // 0x04 => OTA. Payload: 0x04 + "url|sha256" (sha opcional). Enfileira; roda em otaTick().
+        if (b == 0x04) {
+          if (otaInProgress || otaRequested) { webSocket.sendTXT("OTA:BUSY"); break; }
+          String params;
+          for (size_t i = 1; i < length; i++) params += (char)payload[i];
+          params.trim();
+          int sep = params.indexOf('|');
+          if (sep < 0) sep = params.indexOf('\n');
+          if (sep < 0) sep = params.indexOf(' ');
+          otaPendingUrl = (sep < 0) ? params : params.substring(0, sep);
+          otaPendingSha = (sep < 0) ? ""     : params.substring(sep + 1);
+          otaPendingUrl.trim();
+          otaPendingSha.trim();
+          if (otaPendingUrl.length() == 0) { webSocket.sendTXT("OTA:FAIL:nourl"); break; }
+          otaRequested = true;
+          webSocket.sendTXT("OTA:QUEUED");
+          break;
+        }
+
+        // 0x06 => restart remoto (enfileira; reinicia em restartTick após a resposta sair)
+        if (b == 0x06) {
+          webSocket.sendTXT("Restarting");
+          restartRequested = true;
+          restartAtMs = millis() + 300;
+          break;
+        }
+
+        // 0x05 => status do AVAIL OUT
+        if (b == 0x05) {
+          char buf[160];
+          snprintf(buf, sizeof(buf),
+            "{\"type\":\"avail\",\"livre\":%s,\"raw\":%d,\"sinceMs\":%lu,"
+            "\"availEn\":%u,\"machineMode\":%u}",
+            availLivre() ? "true" : "false",
+            availStable,
+            (unsigned long)(millis() - availStableAtMs),
+            (unsigned)(availEnabled ? 1 : 0),
+            (unsigned)machineMode
           );
           webSocket.sendTXT(buf);
           break;
@@ -510,6 +700,8 @@ void loop() {
   watchdogTick();
   apLifetimeTick();
   wsRestartTick();
+  otaTick();
+  restartTick();
 
   digitalWrite(ledPin, isWebSocketConnected ? HIGH : LOW);
 }

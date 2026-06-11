@@ -26,7 +26,10 @@
 //   Watchdogs sem restart automático para evitar acionamento indesejado no boot.
 //
 // MONITORAMENTO (independe do modo):
-//   WS 0x03 => responde JSON: rssi, ch, heap, block, cpu, uptime, boots, wifiSlot
+//   WS 0x03 => responde JSON: rssi, ch, heap, block, cpu, uptime, boots, wifiSlot,
+//              machineMode, pulse, fw
+//   WS 0x06 => restart remoto: responde "Restarting" e reinicia após ~200ms
+//   (0x04 OTA e 0x05 AVAIL não existem no ESP-01S: 1MB de flash / sem GPIO livre)
 //
 // WIFI:
 //   Dual WiFi: failover automático entre rede 1 e rede 2 sem restart.
@@ -77,6 +80,9 @@ static const uint8_t COMMIT_TRIES = 3;
 // ======================== WS =========================
 static const char*    WS_HOST = "frst-back-02b607761078.herokuapp.com";
 static const uint16_t WS_PORT = 80;
+
+// Versão do firmware (reportada no WS 0x03 para auditoria da frota)
+#define FW_VERSION "1.0.0"
 
 // ======================== IO (ESP-01/ESP-01S / Generic ESP8266) =========================
 static const int  relayPin = 0;  // GPIO0
@@ -133,6 +139,10 @@ static bool lastLedState = false;
 // WS auto-restart
 static uint32_t wsLastOkMs = 0;
 static const uint32_t WS_RESTART_TIMEOUT_MS = 60UL * 60UL * 1000UL; // 1 hora
+
+// Restart remoto (WS 0x06) — adiado p/ a resposta "Restarting" sair antes do reboot
+static bool     pendingRestart   = false;
+static uint32_t pendingRestartMs = 0;
 
 // ======================== RELAY MODE =========================
 enum MachineMode : uint8_t {
@@ -615,19 +625,32 @@ static void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
           uint8_t  cpu   = ESP.getCpuFreqMHz();
           uint32_t up    = millis() / 1000UL;
 
-          char buf[260];
+          char buf[300];
           snprintf(buf, sizeof(buf),
-            "{\"rssi\":%d,\"ch\":%d,\"heap\":%lu,\"block\":%lu,\"cpu\":%u,\"uptime\":%lu,\"boots\":%lu,\"wifiSlot\":%u}",
+            "{\"rssi\":%d,\"ch\":%d,\"heap\":%lu,\"block\":%lu,\"cpu\":%u,\"uptime\":%lu,\"boots\":%lu,"
+            "\"wifiSlot\":%u,\"machineMode\":%u,\"pulse\":%s,\"fw\":\"%s\"}",
             rssi, ch,
             (unsigned long)heap,
             (unsigned long)block,
             (unsigned)cpu,
             (unsigned long)up,
             (unsigned long)P.bootCount,
-            (unsigned)wifiSlot
+            (unsigned)wifiSlot,
+            (unsigned)machineMode,
+            pulseActive ? "true" : "false",
+            FW_VERSION
           );
           webSocket.sendTXT(buf);
           if (apEnabled) logf("WS BIN 0x03: %s", buf);
+          break;
+        }
+
+        // 0x06 => restart remoto (adiado p/ a resposta sair antes do reboot)
+        if (b == 0x06) {
+          webSocket.sendTXT("Restarting");
+          if (apEnabled) log_append_line("WS BIN 0x06: restart remoto agendado.");
+          pendingRestart   = true;
+          pendingRestartMs = millis() + 200;
           break;
         }
 
@@ -1287,6 +1310,13 @@ static void wsRestartTick() {
   }
 }
 
+// Restart remoto solicitado via WS 0x06 (executado fora do callback)
+static void remoteRestartTick() {
+  if (!pendingRestart) return;
+  if ((int32_t)(millis() - pendingRestartMs) < 0) return;
+  ESP.restart();
+}
+
 // ======================== SETUP / LOOP =========================
 void setup() {
   Serial.begin(115200);
@@ -1357,4 +1387,5 @@ void loop() {
   watchdogTick();
   apLifetimeTick();
   wsRestartTick();
+  remoteRestartTick();
 }
