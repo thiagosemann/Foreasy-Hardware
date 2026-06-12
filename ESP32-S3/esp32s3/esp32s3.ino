@@ -28,7 +28,7 @@
 // PROTOCOLO WEBSOCKET (binário):
 // - 0x01 => INDUSTRIAL: pulso START IN 100ms | CONVENCIONAL: Relé ON
 // - 0x02 => INDUSTRIAL: ignorado             | CONVENCIONAL: Relé OFF
-// - 0x03 => JSON: rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, temp, machineMode, pulse, fw
+// - 0x03 => JSON: rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, temp, machineMode, pulse, chip, fw
 // - 0x04 => OTA: payload = 0x04 + "url|sha256" (sha256 opcional, 64 hex). Baixa o .bin,
 //           grava com Update, valida SHA256 e reinicia. Respostas async:
 //           "OTA:QUEUED" → "OTA:START" → "OTA:OK:restart" | "OTA:FAIL:<motivo>"
@@ -75,6 +75,7 @@
 #include <mbedtls/sha256.h>
 
 #define FW_VERSION "1.0.0"   // reportado no 0x03 para auditoria da frota (ver PLANO-NOVA-VERSAO.md §1.6)
+#define FW_CHIP    "esp32s3" // identifica o chip na telemetria / seleção de OTA
 
 float readInternalTempC() {
   return temperatureRead();
@@ -399,7 +400,7 @@ void connectToWebSocket() {
 // ================= OTA (Over-The-Air) =================
 // Esboço do PLANO-NOVA-VERSAO.md §1.5: baixa o .bin, grava com Update, valida SHA256, reinicia.
 // Bloqueante por natureza — por isso roda em otaTick() (loop), nunca dentro do callback WS.
-void otaReport(const String& s) {
+void otaReport(String s) {
   Serial.println(s);
   if (isWebSocketConnected) webSocket.sendTXT(s);
 }
@@ -557,11 +558,11 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 
         if (b == 0x03) {
           bool staOk = (WiFi.status() == WL_CONNECTED);
-          char buf[320];
+          char buf[340];
           snprintf(buf, sizeof(buf),
             "{\"rssi\":%d,\"ch\":%d,\"heap\":%u,\"block\":%u,\"cpu\":%u,"
             "\"uptime\":%lu,\"boots\":%lu,\"wifiSlot\":%u,\"temp\":%.1f,"
-            "\"machineMode\":%u,\"pulse\":%s,\"fw\":\"%s\"}",
+            "\"machineMode\":%u,\"pulse\":%s,\"chip\":\"%s\",\"fw\":\"%s\"}",
             staOk ? WiFi.RSSI() : 0,
             staOk ? (int)WiFi.channel() : 0,
             (unsigned)ESP.getFreeHeap(),
@@ -573,6 +574,7 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             readInternalTempC(),
             (unsigned)machineMode,
             pulseActive ? "true" : "false",
+            FW_CHIP,
             FW_VERSION
           );
           webSocket.sendTXT(buf);

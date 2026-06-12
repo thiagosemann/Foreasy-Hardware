@@ -30,6 +30,10 @@
 #include <WiFi.h>
 #include <WebServer.h>
 
+// Identidade do firmware (exposta em /status — protótipo de bancada)
+#define FW_VERSION "1.0.0"
+#define FW_CHIP    "esp32s3"
+
 WebServer server(80);
 
 const int      AVAIL_PIN   = 4;
@@ -148,7 +152,9 @@ void handleStatus() {
   json += "\"availRaw\":"      + String(lastStableState) + ",";
   json += "\"livre\":"         + String(livre ? "true" : "false") + ",";
   json += "\"pulseActive\":"   + String(pulseActive ? "true" : "false") + ",";
-  json += "\"sinceChangeMs\":" + String(millis() - lastChangeAtMs);
+  json += "\"sinceChangeMs\":" + String(millis() - lastChangeAtMs) + ",";
+  json += "\"chip\":\""        + String(FW_CHIP) + "\",";
+  json += "\"fw\":\""          + String(FW_VERSION) + "\"";
   json += "}";
   server.send(200, "application/json", json);
 }

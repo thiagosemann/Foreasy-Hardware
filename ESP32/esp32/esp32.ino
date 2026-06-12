@@ -24,7 +24,8 @@
 // PROTOCOLO WEBSOCKET (binário):
 //   0x01 => INDUSTRIAL: pulso 100ms | CONVENCIONAL: Relay ON  (se relayMode=0)
 //   0x02 => INDUSTRIAL: ignorado    | CONVENCIONAL: Relay OFF (se relayMode=0)
-//   0x03 => JSON: rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, temp
+//   0x03 => JSON: rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, temp,
+//                 machineMode, pulse, chip, fw
 //
 // WIFI: Dual WiFi com failover automático (sem restart)
 //   Conexão não-bloqueante, credenciais nunca apagadas por falha
@@ -50,6 +51,10 @@
 #include <WebServer.h>
 #include <WebSocketsClient.h>
 #include <Preferences.h>
+
+// Identidade do firmware (reportada no WS 0x03 — auditoria da frota / seleção de OTA)
+#define FW_VERSION "1.0.0"
+#define FW_CHIP    "esp32"    // ESP32 (Modelos 3 e 4)
 
 float readInternalTempC() {
   return temperatureRead();
@@ -294,11 +299,11 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 
         if (b == 0x03) {
           bool staOk = (WiFi.status() == WL_CONNECTED);
-          char buf[280];
+          char buf[320];
           snprintf(buf, sizeof(buf),
             "{\"rssi\":%d,\"ch\":%d,\"heap\":%u,\"block\":%u,\"cpu\":%u,"
             "\"uptime\":%lu,\"boots\":%lu,\"wifiSlot\":%u,\"temp\":%.1f,"
-            "\"machineMode\":%u,\"pulse\":%s}",
+            "\"machineMode\":%u,\"pulse\":%s,\"chip\":\"%s\",\"fw\":\"%s\"}",
             staOk ? WiFi.RSSI() : 0,
             staOk ? (int)WiFi.channel() : 0,
             (unsigned)ESP.getFreeHeap(),
@@ -309,7 +314,9 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             (unsigned)wifiSlot,
             readInternalTempC(),
             (unsigned)machineMode,
-            pulseActive ? "true" : "false"
+            pulseActive ? "true" : "false",
+            FW_CHIP,
+            FW_VERSION
           );
           webSocket.sendTXT(buf);
           break;

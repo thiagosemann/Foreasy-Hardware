@@ -27,7 +27,7 @@
 //
 // MONITORAMENTO (independe do modo):
 //   WS 0x03 => responde JSON: rssi, ch, heap, block, cpu, uptime, boots, wifiSlot,
-//              machineMode, pulse, fw
+//              machineMode, pulse, chip, fw
 //   WS 0x06 => restart remoto: responde "Restarting" e reinicia após ~200ms
 //   (0x04 OTA e 0x05 AVAIL não existem no ESP-01S: 1MB de flash / sem GPIO livre)
 //
@@ -81,8 +81,9 @@ static const uint8_t COMMIT_TRIES = 3;
 static const char*    WS_HOST = "frst-back-02b607761078.herokuapp.com";
 static const uint16_t WS_PORT = 80;
 
-// Versão do firmware (reportada no WS 0x03 para auditoria da frota)
+// Identidade do firmware (reportada no WS 0x03 — auditoria da frota / seleção de OTA)
 #define FW_VERSION "1.0.0"
+#define FW_CHIP    "esp8266"   // ESP-01S (Modelo 2)
 
 // ======================== IO (ESP-01/ESP-01S / Generic ESP8266) =========================
 static const int  relayPin = 0;  // GPIO0
@@ -625,10 +626,10 @@ static void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
           uint8_t  cpu   = ESP.getCpuFreqMHz();
           uint32_t up    = millis() / 1000UL;
 
-          char buf[300];
+          char buf[320];
           snprintf(buf, sizeof(buf),
             "{\"rssi\":%d,\"ch\":%d,\"heap\":%lu,\"block\":%lu,\"cpu\":%u,\"uptime\":%lu,\"boots\":%lu,"
-            "\"wifiSlot\":%u,\"machineMode\":%u,\"pulse\":%s,\"fw\":\"%s\"}",
+            "\"wifiSlot\":%u,\"machineMode\":%u,\"pulse\":%s,\"chip\":\"%s\",\"fw\":\"%s\"}",
             rssi, ch,
             (unsigned long)heap,
             (unsigned long)block,
@@ -638,6 +639,7 @@ static void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             (unsigned)wifiSlot,
             (unsigned)machineMode,
             pulseActive ? "true" : "false",
+            FW_CHIP,
             FW_VERSION
           );
           webSocket.sendTXT(buf);

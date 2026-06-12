@@ -291,13 +291,18 @@ async. Protocolo WS idêntico ao ESP32 (+ `0x04`/`0x05`).
 
 Mensagens binárias (1 byte de comando); resposta sempre em texto.
 
+> **Identidade no `0x03`:** todos os firmwares reportam `chip` e `fw` (constantes de
+> compilação `FW_CHIP`/`FW_VERSION`) na telemetria, para auditoria da frota e seleção
+> correta do binário de OTA. Valores de `chip`: `esp8266` (Modelos 1, 2, 5),
+> `esp32` (Modelos 3, 4) e `esp32s3` (firmware principal). `fw` é semver (ex. `1.0.0`).
+
 ### 7.1 ESP8266 (Modelos 1, 2, 5)
 
 | Byte | Modo Industrial | Modo Convencional |
 |------|----------------|-------------------|
 | `0x01` | Pulso relay (100ms) | Relay ON |
 | `0x02` | Ignorado | Relay OFF |
-| `0x03` | Responde JSON: `rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, machineMode, pulse, fw` | idem |
+| `0x03` | Responde JSON: `rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, machineMode, pulse, chip, fw` | idem |
 | `0x06` | Restart remoto — responde `"Restarting"` e reinicia após ~200ms | idem |
 
 > **Não disponível no ESP-01S:** `0x04` (OTA — 1MB de flash não cabe imagem dupla) e
@@ -310,7 +315,7 @@ Mensagens binárias (1 byte de comando); resposta sempre em texto.
 |------|--------------------|-----------------|
 | `0x01` | Relay ON (se `relayMode`=Normal) | Pulso relay (`PULSE_MS`=100ms, se `relayMode`=Normal) |
 | `0x02` | Relay OFF (se `relayMode`=Normal) | Ignorado |
-| `0x03` | Responde JSON: `rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, temp, machineMode, pulse` | idem |
+| `0x03` | Responde JSON: `rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, temp, machineMode, pulse, chip, fw` | idem |
 
 Resposta sempre: `"RelayStatus:ON"` ou `"RelayStatus:OFF"`.
 
@@ -323,7 +328,7 @@ e no **Industrial o pulso sai pelo `startPin` (GPIO START IN), não pelo relé**
 |------|--------------------|-----------------|
 | `0x01` | Relay ON | Pulso no START IN (`PULSE_MS`=100ms) |
 | `0x02` | Relay OFF | Ignorado |
-| `0x03` | Responde JSON: `rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, temp, machineMode, pulse, fw` | idem |
+| `0x03` | Responde JSON: `rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, temp, machineMode, pulse, chip, fw` | idem |
 | `0x04` | OTA — ver [§7.4](#74-detalhe--ota-0x04) | idem |
 | `0x05` | Status do AVAIL — ver [§7.5](#75-detalhe--avail-0x05) | idem |
 | `0x06` | Restart remoto — responde `"Restarting"` e reinicia após ~300ms | idem |
