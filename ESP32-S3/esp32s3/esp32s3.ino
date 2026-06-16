@@ -62,7 +62,7 @@
 //
 // PINOS (configuráveis via /config; strapping ESP32-S3: GPIO0, GPIO3, GPIO45, GPIO46):
 // - ledPin   : GPIO4 (fixo)   - relayPin : GPIO2  (Convencional ON/OFF)
-// - startPin : GPIO5 (START IN, ativo HIGH)   - availPin : GPIO6 (AVAIL OUT, INPUT_PULLUP)
+// - startPin : GPIO5 (START IN, ativo HIGH)   - availPin : GPIO4 (AVAIL OUT, INPUT_PULLUP)
 // ============================================================================
 
 #include <WiFi.h>
@@ -89,7 +89,7 @@ Preferences prefs;
 int ledPin   = 4;   // LED status WS (fixo)
 int relayPin = 2;   // Convencional: relé ON/OFF
 int startPin = 5;   // Industrial: pulso START IN (Speed Queen H3-7), ativo HIGH
-int availPin = 6;   // Industrial: leitura AVAIL OUT (Speed Queen H3-4), INPUT_PULLUP
+int availPin = 4;   // Industrial: leitura AVAIL OUT (Speed Queen H3-4), INPUT_PULLUP
 
 // ---------- Machine Mode ----------
 enum MachineMode : uint8_t { MODE_CONVENTIONAL = 0, MODE_INDUSTRIAL = 1 };
