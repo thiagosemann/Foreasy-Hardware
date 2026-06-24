@@ -36,6 +36,11 @@
 //           "sinceMs":ms,"availEn":0/1,"machineMode":0/1}
 // - 0x06 => Restart remoto. Responde "Restarting" e reinicia após ~300ms.
 //
+// DETECÇÃO DE FICHA (token) — só com availEnabled e creditState IDLE (§11):
+// - "TokenInserted" : AVAIL LOW→HIGH externo (ficha) ou snapshot ocupado no connect
+// - "TokenFinished" : AVAIL HIGH→LOW externo ou snapshot livre no connect
+//   O backend cruza com is_in_use antes de marcar a ficha (não toca is_in_use).
+//
 // WIFI:
 // - Dual WiFi com failover automático entre rede 1 e rede 2 (sem restart)
 // - Conexão não-bloqueante: wifiTick() com timeout 40s e retry a cada 5s
@@ -233,6 +238,7 @@ void handleRelayTick() {
 }
 
 // ================= AVAIL OUT (leitura com debounce) =================
+// Lê o status da máquina e notifica transições externas (ficha) ao backend (§11.4a).
 void readAvailTick() {
   int reading = digitalRead(availPin);
   if (reading != availReading) {
@@ -240,8 +246,16 @@ void readAvailTick() {
     availLastMs  = millis();
   }
   if (reading != availStable && (millis() - availLastMs) >= AVAIL_DEBOUNCE_MS) {
+    int prevStable  = availStable;          // salva antes de atualizar
     availStable     = reading;
     availStableAtMs = millis();
+
+    // Detecção de ficha (§11): creditState == CR_IDLE garante que a transição NÃO foi do
+    // nosso creditTick. O backend ainda cruza com is_in_use antes de marcar ficha (§11.1).
+    if (availEnabled && isWebSocketConnected && creditState == CR_IDLE) {
+      if      (prevStable == LOW  && availStable == HIGH) webSocket.sendTXT("TokenInserted");
+      else if (prevStable == HIGH && availStable == LOW)  webSocket.sendTXT("TokenFinished");
+    }
   }
 }
 
@@ -529,6 +543,11 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       resetWsBackoff();
       String msg = isRelayEffectiveOn() ? ("ID:" + nodeId) : ("NID:" + nodeId);
       webSocket.sendTXT(msg);
+      // Snapshot do AVAIL na reconexão (§11.4b): resolve ficha iniciada/encerrada com o WS
+      // caído. O backend cruza com is_in_use, então em uso nosso legítimo vira no-op.
+      if (availEnabled && creditState == CR_IDLE) {
+        webSocket.sendTXT(availLivre() ? "TokenFinished" : "TokenInserted");
+      }
       Serial.printf("WS conectado. Sent: %s | mode=%s\n", msg.c_str(),
                     machineMode == MODE_INDUSTRIAL ? "INDUSTRIAL" : "CONVENCIONAL");
       break;

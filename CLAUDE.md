@@ -909,7 +909,7 @@ ambiguidade.
 ### 11.21 Checklist de implementação (ordem sugerida)
 
 1. [ ] **DB:** `ALTER TABLE Machines ADD COLUMN token_in_use TINYINT NOT NULL DEFAULT 0;` (§11.3)
-2. [ ] **Firmware** `esp32s3.ino` + `esp32c3.ino`: transição em `readAvailTick` (§11.4a) + snapshot no `WStype_CONNECTED` (§11.4b)
+2. [x] **Firmware** `esp32s3.ino` + `esp32c3.ino`: transição em `readAvailTick` (§11.4a) + snapshot no `WStype_CONNECTED` (§11.4b)
 3. [ ] **Backend** `machineModel.js`: `setTokenInUse()` + export (§11.6)
 4. [ ] **Backend** `websocket.js`: handlers `TokenInserted`/`TokenFinished` com cruzamento `is_in_use` (§11.5)
 5. [ ] **Backend** `gerenciadorMaquina.js`: bloquear ligar em `ligarMaquina` e `ligarMaquinaIndustrial` (§11.8)
