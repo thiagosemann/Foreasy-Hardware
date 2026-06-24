@@ -448,21 +448,55 @@ Confirmação de sucesso: AVAIL OUT transita de LOW → HIGH após pulso (janela
 
 Objetivo: permitir uso paralelo de ficha física na Speed Queen ao mesmo tempo que nosso
 sistema está ativo. Quando alguém insere uma ficha, o IOT detecta a mudança externa do
-AVAIL e notifica o backend, que expõe o estado `token_in_use` para o frontend.
+AVAIL e notifica o backend, que persiste o estado `token_in_use` na máquina e o expõe ao
+frontend pelo poll existente de 30s.
 
-### 11.1 Princípio
+### 11.1 Princípio — campo dedicado, `is_in_use` INTOCADO
 
-Condição de ativação externa (ficha): AVAIL transita LOW→HIGH **sem** que o `creditTick`
-estivesse ativo (`creditState == CR_IDLE`). Significa que a máquina foi ligada por fora
-do nosso sistema.
+- **`is_in_use` continua significando só "uso pelo nosso sistema"** (com `UsageHistory`,
+  crédito, transação). **Ficha NÃO seta `is_in_use`.**
+- Ficha mora num campo próprio e **persistente**: `Machines.token_in_use` (coluna nova).
+- O front trata `token_in_use` como "ocupada" só na renderização (ícone/ordem/clique).
 
-Nenhuma mudança de banco de dados necessária. Estado mantido em memória no backend.
-Frontend recebe `token_in_use` no poll existente de 30s — sem chamadas extras.
+**Fonte da verdade = backend.** Quem sabe se uma ocupação (AVAIL=HIGH) é *nossa* ou de
+*ficha* é o backend, porque o ESP, após reboot, não lembra se foi o `creditTick` quem ligou.
+Regra ao receber sinal de AVAIL ocupado do firmware:
 
-### 11.2 Firmware (`esp32s3.ino` e `esp32c3.ino` — mesma mudança nos dois)
+| AVAIL | `is_in_use` (DB) | Conclusão |
+|-------|------------------|-----------|
+| ocupado | `1` | uso nosso → **ignora** (não marca ficha) |
+| ocupado | `0` | **ficha** → `token_in_use = 1` |
+| livre | — | `token_in_use = 0` |
 
-Em `readAvailTick()`, salvar o estado anterior **antes** de atualizar e emitir mensagens
-na transição quando `availEnabled && creditState == CR_IDLE`:
+### 11.2 Por que NÃO reusar `is_in_use` (a armadilha do gerenciador)
+
+`gerenciarEstadosECreditos` (`gerenciadorMaquina.js`) roda a cada 60s sobre toda máquina
+com `is_in_use=1` e busca `getLastMachineUsage()` → `getLastUsageByMachine` retorna o
+**último registro de todos os tempos** (`ORDER BY id DESC LIMIT 1`, sem filtro de uso aberto).
+Se setássemos `is_in_use=1` para a ficha, o gerenciador casaria a ficha com o registro do
+**usuário anterior** e, dependendo do tipo:
+
+- `ConvencionalManualHora` → **desconta crédito do usuário antigo a cada minuto**.
+- `ConvencionalAutomaticoCiclo` → cria **transação no nome do usuário antigo** e desliga.
+- `IndustrialAutomaticoCiclo` → push de "ciclo finalizado" para o **usuário errado**.
+
+Mantendo a ficha fora do `is_in_use`, a primeira linha do loop
+(`if (!machine.is_in_use) continue;`) **pula a máquina-ficha automaticamente** →
+`gerenciarEstadosECreditos` **não precisa de NENHUMA alteração** e não há risco de cobrança.
+
+### 11.3 Banco de dados — migration
+
+```sql
+ALTER TABLE Machines ADD COLUMN token_in_use TINYINT NOT NULL DEFAULT 0;
+```
+
+`getMachinesByBuilding` no model faz `SELECT * FROM Machines` → a coluna nova **já flui para
+o front de graça**, sem mexer no `machinesController.js`.
+
+### 11.4 Firmware (`esp32s3.ino` e `esp32c3.ino` — mesma mudança nos dois)
+
+**(a) Transição em tempo real** — em `readAvailTick()`, salvar o estado anterior **antes** de
+atualizar e emitir na transição quando `availEnabled && creditState == CR_IDLE`:
 
 ```cpp
 void readAvailTick() {
@@ -476,8 +510,8 @@ void readAvailTick() {
     availStable     = reading;
     availStableAtMs = millis();
 
-    // Ativação/desativação externa (ficha): availEnabled garante pino físico conectado;
-    // creditState == CR_IDLE garante que não foi o nosso servidor quem ativou.
+    // creditState == CR_IDLE garante que não foi o nosso creditTick quem ativou.
+    // O backend ainda cruza com is_in_use antes de marcar ficha (ver §11.1).
     if (availEnabled && isWebSocketConnected && creditState == CR_IDLE) {
       if (prevStable == LOW  && availStable == HIGH) webSocket.sendTXT("TokenInserted");
       else if (prevStable == HIGH && availStable == LOW)  webSocket.sendTXT("TokenFinished");
@@ -486,103 +520,409 @@ void readAvailTick() {
 }
 ```
 
+**(b) Snapshot na reconexão** — em `WStype_CONNECTED`, logo após enviar `ID:`/`NID:`, reportar
+o estado atual do AVAIL (resolve ficha iniciada/encerrada enquanto o WS estava caído):
+
+```cpp
+if (availEnabled && creditState == CR_IDLE) {
+  webSocket.sendTXT(availLivre() ? "TokenFinished" : "TokenInserted");
+}
+```
+
+O backend cruza com `is_in_use` (§11.1), então um `TokenInserted` de uma máquina que está em
+uso legítimo nosso (`is_in_use=1`) vira no-op — sem falso-positivo.
+
 **Mensagens novas no protocolo WS (ESP32-S3 e ESP32-C3, texto):**
 
-| Mensagem | Quando | Condição |
-|----------|--------|----------|
-| `"TokenInserted"` | AVAIL LOW→HIGH externo | `availEnabled && creditState==CR_IDLE` |
-| `"TokenFinished"` | AVAIL HIGH→LOW externo | `availEnabled && creditState==CR_IDLE` |
+| Mensagem | Quando | Condição no firmware |
+|----------|--------|----------------------|
+| `"TokenInserted"` | AVAIL LOW→HIGH externo, ou snapshot ocupado no connect | `availEnabled && creditState==CR_IDLE` |
+| `"TokenFinished"` | AVAIL HIGH→LOW externo, ou snapshot livre no connect | `availEnabled && creditState==CR_IDLE` |
 
-> **Nota de reconexão:** o firmware só envia na *transição*. Se o WS desconecta enquanto
-> a ficha está rodando e reconecta depois, o backend perde o evento. Mitigation MVP:
-> limpar o estado de token no reconect (conservativo — mostra Livre até próxima ficha).
-> Post-MVP: backend envia 0x05 na reconexão para verificar AVAIL atual.
-
-### 11.3 Backend — `websocket.js`
+### 11.5 Backend — `websocket.js`
 
 ```js
-// Novo Set em memória (junto com disconnectTimers, etc.)
-const tokenInUseNodes = new Set(); // nodeIds com ficha ativa
+const machinesModel = require('./models/machineModel');
 
-// Em ws.on('message'), adicionar após o bloco OTA:
+// Em ws.on('message'), após o bloco OTA:
 } else if (messageString === 'TokenInserted') {
   const nodeId = getConnectionNodeId(ws);
   if (nodeId !== 'unknown') {
-    tokenInUseNodes.add(nodeId);
-    console.log(`[WS] TokenInserted: nodeId=${nodeId}`);
+    // Cruzamento (§11.1): só marca ficha se NÃO houver uso nosso ativo.
+    machinesModel.getMachineByIdNodeMcu(nodeId)
+      .then((m) => {
+        if (m && !m.is_in_use) return machinesModel.setTokenInUse(nodeId, 1);
+      })
+      .catch((e) => console.error('[WS] TokenInserted falhou:', e && e.message));
   }
 } else if (messageString === 'TokenFinished') {
   const nodeId = getConnectionNodeId(ws);
   if (nodeId !== 'unknown') {
-    tokenInUseNodes.delete(nodeId);
-    console.log(`[WS] TokenFinished: nodeId=${nodeId}`);
+    machinesModel.setTokenInUse(nodeId, 0)
+      .catch((e) => console.error('[WS] TokenFinished falhou:', e && e.message));
   }
 }
-
-// No bloco ID:/NID: (reconexão do device), antes de cancelDisconnectLog:
-tokenInUseNodes.delete(nodeId); // reconexão = estado fresco
-
-// Nova função exportada:
-function isTokenInUse(nodeId) {
-  return tokenInUseNodes.has(nodeId);
-}
-// + adicionar ao module.exports
 ```
 
-### 11.4 Backend — `machinesController.js`
+> **Nota:** `TokenFinished` limpa incondicionalmente. Quando dispara no fim de um uso NOSSO
+> (AVAIL livre, `creditState==IDLE`), `token_in_use` já era `0` → no-op inofensivo.
 
-Em `getMachinesByBuilding()`, dentro do `map` de `enrichedMachines`:
+### 11.6 Backend — `machineModel.js` (nova função)
 
 ```js
-const { isTokenInUse } = require('../websocket');
-
-// junto com machine.isConnected = ...
-machine.token_in_use = isTokenInUse(machine.idNodemcu) ? 1 : 0;
+const setTokenInUse = async (idNodemcu, value) => {
+  const [result] = await connection.execute(
+    'UPDATE Machines SET token_in_use = ? WHERE idNodemcu = ?',
+    [value ? 1 : 0, idNodemcu]
+  );
+  return result.affectedRows > 0;
+};
+// + exportar setTokenInUse
 ```
 
-### 11.5 Frontend — `machines.ts`
+### 11.7 Auditoria de `is_in_use` — o trade-off do campo separado
 
+Como a ficha **não** seta `is_in_use`, todo código que lê `is_in_use` como "ocupada/indisponível"
+passa a ver a máquina-ficha como **livre**. Regra para classificar cada uso:
+
+- **Semântica "ocupada fisicamente"** (bloquear ligar, exibir ocupada, contar indisponível)
+  → precisa virar `is_in_use || token_in_use`.
+- **Semântica "uso NOSSO" / pago** (cobrança, ciclo, reforço, "por mim", crédito, end_time)
+  → **deixar como está** (a ficha não é nosso uso; já fica de fora corretamente).
+
+Itens "por mim"/`user_id` e `end_time`/cronômetro já ficam seguros sozinhos: a ficha não tem
+`user_id` nem `end_time`, então `isInUseByMe`/`getAvailPhase` já retornam falso/null.
+
+### 11.8 Backend — bloquear novas ativações (`gerenciadorMaquina.js`)
+
+Ponto crítico: hoje `is_in_use` barra religar a máquina. A ficha precisa barrar também,
+senão o sistema tentaria pulsar uma máquina já ocupada por ficha. `getMachineById` faz
+`SELECT *` → já traz `token_in_use`, sem mudança no model.
+
+**`ligarMaquina` (~linha 212) — ANTES:**
+```js
+if (machine.is_in_use) {
+    return Utilidades.tratarBadRequest(res, "Máquina já está ligada!")
+}
+```
+**DEPOIS:**
+```js
+if (machine.is_in_use) {
+    return Utilidades.tratarBadRequest(res, "Máquina já está ligada!")
+}
+if (machine.token_in_use) {
+    return Utilidades.tratarBadRequest(res, "Máquina em uso por ficha!")
+}
+```
+
+**`ligarMaquinaIndustrial` (~linha 317) — ANTES:**
+```js
+if (machine.is_in_use) {
+    return Utilidades.tratarBadRequest(res, "Máquina já está ligada!")
+}
+```
+**DEPOIS:**
+```js
+if (machine.is_in_use) {
+    return Utilidades.tratarBadRequest(res, "Máquina já está ligada!")
+}
+if (machine.token_in_use) {
+    return Utilidades.tratarBadRequest(res, "Máquina em uso por ficha!")
+}
+```
+
+> No caminho AVAIL o `creditStart` ainda devolveria `CreditBusy`, mas barrar antes com
+> mensagem clara é melhor UX e evita pulso desnecessário na máquina.
+
+### 11.9 Backend — o que NÃO mudar (confirmação da auditoria)
+
+| Local | Linha | Por que deixar |
+|-------|-------|----------------|
+| `gerenciarEstadosECreditos` | 33 | `if (!machine.is_in_use) continue;` — ficha (is_in_use=0) já é pulada → **sem cobrança** |
+| `reforçarSinalParaLigar` | 485 | `if (!machine.is_in_use)` — reforço é só de uso nosso; ficha não se reforça |
+| `websocket.js` relay-sync | 192 | `cmd = is_in_use ? 0x01 : 0x02` só roda p/ **convencional**; ficha é Speed Queen/AVAIL → não entra |
+| `machineModel.getAllMachines` | 21 | `M.is_in_use = 1` no JOIN é sobre uso pago → correto manter |
+
+Opcional (precisão da IA do chat, não bloqueante): `chatController.js:133` e `PromptChat.js`
+(`is_in_use ? 'em uso' : 'disponível'`) podem considerar `token_in_use` para o assistente
+descrever a máquina-ficha como ocupada.
+
+### 11.10 Frontend — `machines.ts` (interface + helpers)
+
+Adicionar o campo à interface `Machine`:
 ```ts
 token_in_use?: number;  // 1 = em uso por ficha (não via nosso sistema)
 ```
 
-### 11.6 Frontend — `disponibilidade-maquinas.component.ts`
+> **Onde colocar os helpers:** os métodos abaixo são por-componente (cada tela tem os seus).
+> `isTokenInUse` é a verificação central; replicar nos componentes que precisarem (ou extrair
+> para um util compartilhado, se preferir). `is_in_use` é sempre `0` na ficha — o `&& !is_in_use`
+> é redundante mas deixa a intenção explícita.
 
-Novo helper:
 ```ts
-isTokenInUse(machine: Machine): boolean {
-  return !!machine.token_in_use && !machine.is_in_use;
-}
+isTokenInUse(m: Machine): boolean { return !!m.token_in_use && !m.is_in_use; }
+isOccupied(m: Machine): boolean   { return !!m.is_in_use || !!m.token_in_use; }
 ```
 
-Métodos a atualizar (adicionar `if (this.isTokenInUse(m))` antes do `is_in_use` genérico):
+### 11.11 Frontend (A) — `disponibilidade-maquinas.component.ts`
 
-| Método | Retorno para ficha |
-|--------|-------------------|
-| `getStatusLabel()` | `'Em uso (ficha)'` |
-| `getStatusClass()` | `'in-use-token'` |
-| `getStatusIcon()` | `'toll'` |
-| `getSubtitle()` | `'Máquina em uso por ficha'` |
-| `isAvailable()` | adicionar `&& !machine.token_in_use` |
-| `isCycleAnimating()` | não anima (sem `end_time`) |
+Adicionar o helper `isTokenInUse` (acima) e alterar os métodos. Em cada um, inserir o ramo
+da ficha **logo antes** do ramo genérico `if (machine.is_in_use)`.
 
-Adicionar CSS class `in-use-token` no `.css` (sugestão: cor âmbar, similar ao agendamento).
+**`getStatusLabel()`** — antes de `if (machine.is_in_use) return 'Em uso';`:
+```ts
+    if (this.isInUseByMe(machine)) return 'Em uso por mim';
+    if (this.isTokenInUse(machine)) return 'Em uso (ficha)';      // NOVO
+    if (this.getAvailPhase(machine) === 'clothes') return 'Roupas dentro';
+    if (machine.is_in_use) return 'Em uso';
+    return 'Livre';
+```
 
-### 11.7 Fluxo completo
+**`getStatusClass()`** — antes de `if (machine.is_in_use) return 'in-use';`:
+```ts
+    if (this.isTokenInUse(machine)) return 'in-use-token';         // NOVO
+```
+
+**`getStatusIcon()`** — antes de `if (machine.is_in_use) return 'autorenew';`:
+```ts
+    if (this.isTokenInUse(machine)) return 'toll';                 // NOVO
+```
+
+**`getSubtitle()`** — antes de `if (machine.is_in_use) return 'Máquina em uso';`:
+```ts
+    if (this.isTokenInUse(machine)) return 'Máquina em uso por ficha';   // NOVO
+```
+
+**`getMachineIcon()`** — antes de `if (machine.is_in_use) return '...EmUso.svg';`:
+```ts
+    if (this.isTokenInUse(machine)) return '../../../assets/images/maquinaLavaEmUso.svg'; // NOVO
+```
+
+**`isAvailable()`** — ANTES:
+```ts
+    return !machine.is_in_use && !machine.manutencao && !!machine.isConnected;
+```
+DEPOIS:
+```ts
+    return !machine.is_in_use && !machine.token_in_use && !machine.manutencao && !!machine.isConnected;
+```
+(Isso já torna a ficha **não clicável**, pois `isClickable()` depende de `isAvailable()`.)
+
+**`orderMachines()` — rank** — adicionar a ficha como "em uso por outro" (rank 3):
+```ts
+    if (this.isAvailable(m))                       return 1;
+    if (m.agendamento?.isOwner)                    return 2;
+    if (this.isTokenInUse(m))                      return 3;  // NOVO (junto com em uso por outro)
+    if (m.is_in_use)                               return 3;
+```
+
+**`isCycleAnimating()`** — sem mudança: ficha tem `is_in_use=0` e sem `end_time` → já não anima.
+
+**CSS (`disponibilidade-maquinas.component.css`)** — nova classe `in-use-token`
+(sugestão: âmbar, similar ao agendamento). Espelhar as regras de `.in-use`/`.agendado`.
+
+### 11.12 Frontend (B) — `admin-panel/machines-control`
+
+Adicionar `isTokenInUse` ao componente e alterar (inserir o ramo da ficha **após** o
+`if (machine.is_in_use)`, pois no admin o offline tem prioridade só sobre o livre):
+
+**`getStatusClass()`:**
+```ts
+    if (machine.is_in_use) return machine.isConnected ? 'in-use' : 'in-use-offline';
+    if (this.isTokenInUse(machine)) return 'in-use-token';        // NOVO
+```
+**`getStatusIcon()`:**
+```ts
+    if (machine.is_in_use) return 'autorenew';
+    if (this.isTokenInUse(machine)) return 'toll';                // NOVO
+```
+**`getStatusLabel()`:**
+```ts
+    if (machine.is_in_use) return 'Em uso';
+    if (this.isTokenInUse(machine)) return 'Em uso (ficha)';      // NOVO
+```
+**`getSubtitle()`** — adicionar após o bloco `if (machine.is_in_use) { ... }`:
+```ts
+    if (this.isTokenInUse(machine)) return 'Em uso por ficha';    // NOVO
+```
+**`getCardClass()`:**
+```ts
+    if (machine.is_in_use) return 'uso';
+    if (this.isTokenInUse(machine)) return 'uso';                 // NOVO (ou 'uso-token')
+```
+**`sortedMachines()` — priorityOrder:**
+```ts
+        if (m.is_in_use) return 0;
+        if (m.token_in_use) return 0;                             // NOVO (ocupada no topo)
+```
+
+**HTML (`machines-control.component.html`):**
+- Badge (após o `*ngIf="machine.is_in_use"`):
+```html
+<span *ngIf="machine.token_in_use && !machine.is_in_use" class="mc-badge mc-badge-uso">Ficha</span>
+```
+- Badge "Livre" — adicionar `&& !machine.token_in_use` na condição (l.96):
+```html
+<span *ngIf="!machine.is_in_use && !machine.token_in_use && (machine.manutencao ?? 0) !== 1 && machine.isConnected"
+      class="mc-badge-livre-only">Livre</span>
+```
+- Botão Ligar (industrial e convencional): adicionar `&& !machine.token_in_use` para não
+  oferecer "Ligar" numa máquina ocupada por ficha.
+
+### 11.13 Frontend (C) — `qr-code-scanner` (CRÍTICO)
+
+É onde o usuário cai ao escanear/clicar. Como a ficha tem `is_in_use=0`, sem tratamento a
+tela ofereceria **"LIGAR"** e o backend recusaria depois (§11.8). Melhor barrar na própria tela.
+
+A tela já tem o mecanismo `showMachineUnavailable` + `machineUnavailableReason`
+(usado p/ `manutencao`/`fora-horario`/`desconectada`). Adicionar o motivo `'ficha'`:
+
+**No `continuarComMaquina()` (ou no ponto onde checa manutenção/horário/desconexão), adicionar:**
+```ts
+if (machine?.token_in_use && !machine.is_in_use) {
+  this.selectedMachine = machine;
+  this.showMachineUnavailable = true;
+  this.machineUnavailableReason = 'ficha';   // novo motivo
+  return;
+}
+```
+- Adicionar o texto do motivo `'ficha'` no modal/HTML de máquina indisponível
+  ("Máquina em uso por ficha").
+- Defensivo (caso chegue ao banner): no `.html`, onde decide `banner-ligar`/`EM USO`,
+  tratar `token_in_use` como ocupada para não renderizar "LIGAR".
+
+### 11.14 Frontend (D) — `status-maquinas`
+
+`is_in_use` é lido como "ocupada" em filtros, classes e no guard de clique. Adicionar
+`token_in_use` em todos os pontos de **disponibilidade**:
+
+**`.ts` — filtros de máquinas livres (l.356, 401, 444) — ANTES:**
+```ts
+... .filter(m => !m.is_in_use && !m.manutencao && m.isConnected) ...
+```
+DEPOIS:
+```ts
+... .filter(m => !m.is_in_use && !m.token_in_use && !m.manutencao && m.isConnected) ...
+```
+
+**`isMachineAgendada()` (l.382)** — manter; mas garantir que a ficha não apareça como livre:
+o tratamento dos filtros/classes acima já cobre. (Ficha não é agendamento.)
+
+**`.html`** — nas classes `free-machine`/`in-use` e no guard de clique
+`machine.is_in_use || machine.manutencao || isMachineAgendada(...) ? null : goToQRCode()`,
+adicionar `|| machine.token_in_use`. No texto de status, exibir `'Ficha'` quando
+`token_in_use && !is_in_use`.
+
+### 11.15 Frontend (E) — `lavanderia-easy-use`
+
+**`refreshFilteredMachines()` (l.218–232)** — os filtros de "iniciar" (livres) precisam excluir
+a ficha; o filtro de "encerrar" (`is_in_use && user_id===uid`) é uso nosso → **não mexer**.
+
+ANTES (todas as linhas de "livre"):
+```ts
+this.filteredMachines = this.machines.filter(m => !m.is_in_use && m.isConnected !== false && !m.manutencao);
+```
+DEPOIS:
+```ts
+this.filteredMachines = this.machines.filter(m => !m.is_in_use && !m.token_in_use && m.isConnected !== false && !m.manutencao);
+```
+**`.html` (l.96–97)** — opcional: mostrar "Em uso" (ficha) em vez de "Disponível" quando
+`token_in_use`.
+
+### 11.16 Frontend (F) — `home-screen`
+
+**Contagem de livres (l.170-172) — ANTES:**
+```ts
+const livres = normalized.filter(m =>
+  !m.is_in_use && !m.manutencao && m.isConnected
+);
+```
+DEPOIS:
+```ts
+const livres = normalized.filter(m =>
+  !m.is_in_use && !m.token_in_use && !m.manutencao && m.isConnected
+);
+```
+`maquinaEmUsoPorMim` (usa `user_id`) → **não mexer** (ficha não tem `user_id`).
+
+### 11.17 Frontend — deixar como está (ficha já segura)
+
+| Ponto | Por quê |
+|-------|---------|
+| `isInUseByMe` / "por mim" | depende de `user_id`; ficha não tem → já retorna falso |
+| `getAvailPhase` / cronômetro / `end_time` | ficha não tem `end_time` → retorna `null` |
+| `gerenciadorMaquinas.ts` `processMachine` | decisão ligar/desligar é coberta pelo bloqueio do `qr-code-scanner` |
+| Modais de agendamento, fluxo de reforço | semântica de uso nosso |
+
+### 11.18 Fluxo completo
 
 ```
 Ficha inserida
   → Speed Queen: AVAIL OUT LOW → HIGH
   → ESP (readAvailTick, debounce 50ms, creditState=IDLE, availEnabled=true)
   → ESP envia WS "TokenInserted"
-  → Backend: tokenInUseNodes.add(nodeId)
-  → Frontend poll 30s: machine.token_in_use = 1
-  → UI: "Em uso (ficha)" — ícone toll, cor âmbar, não clicável
+  → Backend: getMachineByIdNodeMcu → is_in_use==0 → setTokenInUse(nodeId, 1)
+  → DB: Machines.token_in_use = 1   (persiste; sobrevive a restart do dyno)
+  → Frontend poll 30s: SELECT * → machine.token_in_use = 1
+  → UI (todas as telas): "Em uso (ficha)" / ocupada / não clicável
+  → Backend bloqueia tentativa de ligar (§11.8)
 
 Ciclo termina / roupas retiradas
   → AVAIL OUT HIGH → LOW
   → ESP envia WS "TokenFinished"
-  → Backend: tokenInUseNodes.delete(nodeId)
-  → Frontend poll 30s: machine.token_in_use = 0
-  → UI: "Livre"
+  → Backend: setTokenInUse(nodeId, 0)
+  → Frontend poll 30s: machine.token_in_use = 0 → "Livre"
+
+Reconexão do device (WS caiu durante a ficha)
+  → WStype_CONNECTED → ESP envia snapshot ("TokenInserted"/"TokenFinished")
+  → Backend cruza com is_in_use → re-sincroniza token_in_use (self-healing)
 ```
+
+### 11.19 Edge cases conhecidos
+
+- **`TokenFinished` perdido com device offline:** se a ficha encerra com o WS caído, o estado
+  fica preso em `1` até a próxima reconexão — o snapshot do connect (§11.4b) corrige.
+  Hardening opcional (post-MVP): job lê AVAIL (0x05) das máquinas com `token_in_use=1` e
+  limpa as livres.
+- **Crédito nosso que falhou mas a máquina ligou tarde** (`CreditFail`, `is_in_use=0`, AVAIL
+  sobe depois): será marcada como ficha. Aceitável — a máquina está fisicamente ocupada.
+
+### 11.20 Alternativa descartada — inferir ficha pelo timestamp do `lastUsage`
+
+Ideia considerada: setar `is_in_use=1` na ficha e distinguir "ficha vs uso nosso" comparando
+`now` com o `start_time`/`end_time` do `lastUsage` ("se está em uso mas o horário é depois do
+último registro, é ficha"). **Descartada** por dois motivos:
+
+1. **Não evita mexer no gerenciador:** com `is_in_use=1`, `gerenciarEstadosECreditos` deixa de
+   pular a máquina e cobraria o usuário antigo — seria preciso embutir a comparação de tempo
+   dentro dele de qualquer forma.
+2. **Colisão com a fase "roupas dentro" das máquinas `usa_avail`:** uma lavagem nossa que
+   terminou o ciclo mas aguarda retirada da roupa tem **assinatura idêntica** a uma ficha
+   (`is_in_use=1` na nossa, `end_time` no passado, AVAIL ocupado). Nenhum limiar de tempo
+   separa os dois — e como **só** máquinas `usa_avail` têm AVAIL, o heurístico falharia
+   justamente em 100% do hardware onde a ficha é detectável, podendo classificar a lavagem de
+   um morador como ficha e quebrar a liberação automática por retirada de roupa.
+
+A coluna dedicada (`token_in_use`) é ortogonal a timers e a `is_in_use`, então não sofre dessa
+ambiguidade.
+
+### 11.21 Checklist de implementação (ordem sugerida)
+
+1. [ ] **DB:** `ALTER TABLE Machines ADD COLUMN token_in_use TINYINT NOT NULL DEFAULT 0;` (§11.3)
+2. [ ] **Firmware** `esp32s3.ino` + `esp32c3.ino`: transição em `readAvailTick` (§11.4a) + snapshot no `WStype_CONNECTED` (§11.4b)
+3. [ ] **Backend** `machineModel.js`: `setTokenInUse()` + export (§11.6)
+4. [ ] **Backend** `websocket.js`: handlers `TokenInserted`/`TokenFinished` com cruzamento `is_in_use` (§11.5)
+5. [ ] **Backend** `gerenciadorMaquina.js`: bloquear ligar em `ligarMaquina` e `ligarMaquinaIndustrial` (§11.8)
+6. [ ] **Frontend** `machines.ts`: campo `token_in_use` + helper `isTokenInUse` (§11.10)
+7. [ ] **Frontend** `disponibilidade-maquinas` (.ts + .css `in-use-token`) (§11.11)
+8. [ ] **Frontend** `machines-control` (.ts + .html) (§11.12)
+9. [ ] **Frontend** `qr-code-scanner` — motivo `'ficha'` (§11.13)
+10. [ ] **Frontend** `status-maquinas` (§11.14)
+11. [ ] **Frontend** `lavanderia-easy-use` (§11.15)
+12. [ ] **Frontend** `home-screen` (§11.16)
+13. [ ] (Opcional) **Backend** `chatController.js` / `PromptChat.js` (§11.9)
+14. [ ] **NÃO tocar:** `gerenciarEstadosECreditos`, `reforçarSinalParaLigar`, relay-sync do WS (§11.9, §11.17)
+
+**Teste de fumaça (após implementar):** ligar `availEn=1` no wizard de uma máquina Speed Queen,
+inserir ficha física → conferir `TokenInserted` no log do backend, `token_in_use=1` no banco, e
+"Em uso (ficha)" no app; encerrar o ciclo → `TokenFinished` → `token_in_use=0` → "Livre".
