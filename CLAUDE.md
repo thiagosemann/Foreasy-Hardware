@@ -13,6 +13,7 @@ soluções concorrentes (VMlav, VENDPAGO).
 - [8. Configuração da Máquina Speed Queen (MDC)](#8-configuração-da-máquina-speed-queen-mdc)
 - [9. Próximos Passos](#9-próximos-passos)
 - [10. Referências](#10-referências)
+- [11. Plano — Detecção de Uso por Ficha (Token)](#11-plano--detecção-de-uso-por-ficha-token)
 
 ---
 
@@ -83,13 +84,13 @@ O que o produto faz:
 
 ### 4.2 Especificações elétricas (schematic 807300 + ALPM-39201)
 
--> ℹ️ Os valores abaixo são os **limites de catálogo** (com pull-up externo / fonte +5V).
+> ℹ️ Os valores abaixo são os **limites de catálogo** (com pull-up externo / fonte +5V).
 > A ligação **realmente usada e validada** dispensa resistores externos — ver [§4.5](#45-ligação-validada--sem-resistores-externos-).
 
 - **START IN**: 3–30mA, **mínimo 20ms** (schematic 807300); ALPM diz 45ms — usar 100ms no firmware é seguro.
 - **AVAIL OUT**: Vmax 28VDC, Imax 5mA — pull-up externo 10kΩ em H3-4 (COL); H3-5 (EMIT) → GND (H3-2).
 - **Circuito de pulso (alternativa com fonte +5V)**: `+5V (H3-3) → 150Ω externo → H3-7 (START IN)` | `H3-2 → GND do shield`.
- - Cálculo: ~5V / (100Ω interno + 150Ω externo) ≈ 14mA — dentro de 3–30mA ✓
+  - Cálculo: ~5V / (100Ω interno + 150Ω externo) ≈ 14mA — dentro de 3–30mA ✓
 
 ### 4.3 Como medir AVAIL OUT com osciloscópio
 
@@ -109,13 +110,13 @@ O schematic 807300 indica **"ON = AVAILABLE"** — o transistor conduz quando a 
 | **LOW (0V)** — transistor ON     | **Livre / disponível** |
 | **HIGH (3.3V)** — transistor OFF | **Ocupada / em ciclo** |
 
-**Lógica de confirmação após pulso:**
+**Lógica de confirmação após pulso (implementada no firmware como `creditTick`):**
 1. Antes: AVAIL OUT = LOW (máquina livre) → ok para enviar pulso.
 2. Enviar pulso.
 3. Máquina aceita → inicia ciclo → AVAIL OUT vai para HIGH.
-4. HIGH após ~500ms = sucesso | LOW após ~500ms = máquina não aceitou → retry.
+4. HIGH em até 800ms = sucesso | ainda LOW após 800ms = máquina não aceitou → retry.
 
--### 4.5 Ligação validada — sem resistores externos ✅
+### 4.5 Ligação validada — sem resistores externos ✅
 
 > **Testado e funcionando** na bancada (`esp32_avail.ino`) e portado para o ESP32-S3
 > (`esp32s3.ino`). Difere do pull-up externo 10kΩ que as specs originais sugeriam:
@@ -136,7 +137,7 @@ START IN (pulso de crédito):
 - **START IN — sem resistor externo:** o 100Ω interno do H11L1 já limita a corrente.
   `(3.3V − ~1.3V do LED) / 100Ω ≈ 20mA` — dentro da faixa 3–30mA do H11L1 e do limite do GPIO.
 
---
+---
 
 ## 5. Hardware do ESP — Shield Serial (Modelos 1 e 5)
 
@@ -190,15 +191,45 @@ Firmware unificado para onde estamos migrando Industrial + Convencional.
 *(`relayMode` Sempre ON/OFF foi removido — só Industrial/Convencional.)*
 
 - **Industrial** (`machineMode=1`, padrão): **não usa relé**. Dá pulso de `PULSE_MS` (100ms)
-  no `startPin`, direto no optoacoplador START IN (Speed Queen H3-7), ativo HIGH — mesma
-  técnica do `esp32_avail.ino`. WS `0x01` dispara o pulso; `0x02` ignorado.
+  no `startPin`, direto no optoacoplador START IN (Speed Queen H3-7), ativo HIGH.
+  WS `0x01` dispara o pulso (ver [§6.2.1](#621-credit-fail-safe--avail-industrial)); `0x02` ignorado.
 - **Convencional** (`machineMode=0`): relé ON/OFF no `relayPin`. WS `0x01`=ON, `0x02`=OFF.
   `relayType`: `0`=NA (ON=HIGH) / `1`=NF (ON=LOW).
 
-##### AVAIL OUT (leitura) — ✅ testado e funcionando
+#### 6.2.1 Credit fail-safe — AVAIL (Industrial) ✅ implementado
+
+Controlado pela flag `availEnabled` (NVS `availEn`). Modelos sem AVAIL ligado → deixar OFF.
+
+**Máquina de estados `creditTick()` — não-bloqueante:**
+
+| Estado | Descrição |
+|--------|-----------|
+| `CR_IDLE` | Aguardando comando |
+| `CR_PULSE` | Pulso ativo no startPin (100ms) |
+| `CR_CONFIRM` | Aguarda AVAIL ir de LOW→HIGH em até `CREDIT_CONFIRM_MS` (800ms) |
+| `CR_GAP` | Espera `CREDIT_GAP_MS` (400ms) antes do próximo pulso |
+
+**Constantes:**
+- `CREDIT_MAX_ATTEMPTS = 3` — tentativas antes de desistir
+- `CREDIT_CONFIRM_MS = 800` — janela para máquina ficar OCUPADA após pulso
+- `CREDIT_GAP_MS = 400` — pausa entre tentativas
+
+**Comportamento do WS `0x01` no modo Industrial:**
+- **Sem `availEnabled`:** dispara `startPulse()` e responde `"RelayStatus:ON"` imediatamente.
+- **Com `availEnabled`:** chama `creditStart()`, que:
+  - Se máquina OCUPADA (AVAIL=HIGH): responde `"CreditBusy"` e ignora.
+  - Se máquina LIVRE (AVAIL=LOW): entra na máquina de estados; respostas assíncronas:
+    - `"RelayStatus:ON"` — crédito aceito (AVAIL foi para HIGH dentro da janela)
+    - `"CreditFail"` — esgotou `CREDIT_MAX_ATTEMPTS` sem confirmação
+
+#### AVAIL OUT (leitura) — ✅ testado e funcionando
 - `availPin` em `INPUT_PULLUP` (pull-up interno, **sem resistor externo** — ver [§4.5](#45-ligação-validada--sem-resistores-externos-)) com debounce 50ms (`readAvailTick()` no loop).
 - LOW=livre, HIGH=ocupada. Exposto em `/status`, `/info` e no WS `0x05`.
-- Leitura validada (mesma técnica do `esp32_avail.ino`). **Ainda só leitura — não controla nada** (fail-safe `availEn` opcional já implementado, ver [Próximos Passos](#9-próximos-passos)).
+
+> ⚠️ **Discrepância de default do `availPin`:** o C++ inicializa `availPin = 4` (mesmo que `ledPin`),
+> mas o wizard `/config` exibe `6` como fallback. Se nada estiver salvo na NVS, o pino efetivo
+> será GPIO4 — conflitando com o LED. Definir e salvar o pino correto via wizard antes de usar.
+
 #### OTA (Over-The-Air)
 - Disparado pelo WS `0x04` (ver [§7.4](#74-detalhe--ota-0x04)).
 - Baixa o `.bin` por HTTP(S), grava com `Update`, valida SHA256 e reinicia.
@@ -206,14 +237,16 @@ Firmware unificado para onde estamos migrando Industrial + Convencional.
 - Storage do binário **nunca** no Heroku — ver `docs/PLANO-NOVA-VERSAO.md` §4.
 
 #### Pinos e servidor (configuráveis, persistidos na NVS, aplicados no boot)
-- Pinos default: `relayPin`=GPIO2, `startPin`=GPIO5, `availPin`=GPIO6, `ledPin`=GPIO4 (fixo).
+- Pinos default C++: `relayPin`=GPIO2, `startPin`=GPIO5, `availPin`=GPIO4 (⚠️ ver discrepância acima), `ledPin`=GPIO4 (fixo).
+- Wizard `/config` usa como fallback: `relayPin`=2, `startPin`=5, `availPin`=6.
 - Servidor WebSocket (`wsHost`/`wsPort`) editável pelo wizard — default `frst-back-...herokuapp.com:80`.
 
 #### Páginas web (somente duas)
 - `/config` — wizard step-by-step (Rede → Servidor → Modo → Pinos), self-contained e mobile.
-- `/info` — status com auto-refresh 2s (inclui AVAIL, pinos, servidor).
+- `/info` — status com auto-refresh 2s (inclui AVAIL, pinos, servidor, estado do credit fail-safe).
 - `/` redireciona para `/config`.
 - Endpoints de apoio: `/config-data`, `/save`, `/scan`, `/status`, `/resetwifi` (= `prefs.clear()`), `/restart`.
+- `/save` salva na NVS e reinicia o dispositivo.
 
 #### Armazenamento (NVS namespace `wifi`)
 `ssid`, `pass`, `ssid2`, `pass2`, `nodeid`, `machineMode`, `relayType`, `wsHost`,
@@ -326,14 +359,19 @@ e no **Industrial o pulso sai pelo `startPin` (GPIO START IN), não pelo relé**
 
 | Byte | Modo Convencional | Modo Industrial |
 |------|--------------------|-----------------|
-| `0x01` | Relay ON | Pulso no START IN (`PULSE_MS`=100ms) |
+| `0x01` | Relay ON | Pulso no START IN (`PULSE_MS`=100ms). Sem `availEn`: resposta imediata `"RelayStatus:ON"`. Com `availEn`: resposta assíncrona via `creditTick` (ver [§6.2.1](#621-credit-fail-safe--avail-industrial)) |
 | `0x02` | Relay OFF | Ignorado |
 | `0x03` | Responde JSON: `rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, temp, machineMode, pulse, chip, fw` | idem |
 | `0x04` | OTA — ver [§7.4](#74-detalhe--ota-0x04) | idem |
 | `0x05` | Status do AVAIL — ver [§7.5](#75-detalhe--avail-0x05) | idem |
 | `0x06` | Restart remoto — responde `"Restarting"` e reinicia após ~300ms | idem |
 
-Resposta de `0x01`/`0x02`: `"RelayStatus:ON"` ou `"RelayStatus:OFF"`.
+**Respostas do `0x01` no Industrial com `availEn`:**
+- `"RelayStatus:ON"` — máquina aceitou o crédito (AVAIL foi para HIGH)
+- `"CreditBusy"` — máquina já estava OCUPADA quando o comando chegou
+- `"CreditFail"` — máquina não respondeu após `CREDIT_MAX_ATTEMPTS` tentativas
+
+Resposta de `0x01`/`0x02` no Convencional: `"RelayStatus:ON"` ou `"RelayStatus:OFF"`.
 
 #### 7.4 Detalhe — OTA (`0x04`)
 
@@ -374,40 +412,177 @@ Resposta de `0x01`/`0x02`: `"RelayStatus:ON"` ou `"RelayStatus:OFF"`.
 
 ## 9. Próximos Passos
 
-- [x] Leitura do AVAIL OUT implementada no ESP32-S3 (`availPin`, INPUT_PULLUP, debounce) — **só leitura, ainda não usada para controle**
--- [x] AVAIL OUT **testado e validado** no ESP32-S3 com pull-up interno, sem resistor externo (ver [§4.5](#45-ligação-validada--sem-resistores-externos-))
+- [x] Leitura do AVAIL OUT implementada no ESP32-S3 (`availPin`, INPUT_PULLUP, debounce)
+- [x] AVAIL OUT **testado e validado** no ESP32-S3 com pull-up interno, sem resistor externo (ver [§4.5](#45-ligação-validada--sem-resistores-externos-))
+- [x] Credit fail-safe implementado no firmware (`availEnabled` + `creditTick` state machine — ver [§6.2.1](#621-credit-fail-safe--avail-industrial))
 - [ ] Configurar PLSNod = 1 na máquina
-- [ ] Usar o AVAIL no controle: pulso → confirma AVAIL OUT (LOW→HIGH ~500ms) → sucesso/retry (lógica `availEn` já no firmware; validar em campo)
- [ ] Definir shield definitivo do ESP32-S3 (GPIOs de relay/start/avail expostos)
--### Arquitetura alvo
+- [ ] **Validar credit fail-safe em campo** (ligar `availEn=1` no wizard e testar ciclo real na Speed Queen)
+- [ ] Corrigir discrepância do `availPin` default (C++ usa 4, wizard usa 6 — resolver no código)
+- [ ] Definir shield definitivo do ESP32-S3 (GPIOs de relay/start/avail expostos)
+- [ ] **Implementar detecção de uso por ficha** (ver [§11](#11-plano--detecção-de-uso-por-ficha-token))
+
+### Arquitetura alvo
 
 ```
-ESP8266
-  ├── GPIO (out) → 150Ω → H3-7 (START IN)             [pulso de crédito]
-  ├── GPIO (in)  ← pull-up 10kΩ → 3.3V ← H3-4 (AVAIL OUT)  [status]
-  ├── H3-3 (+5V) → alimentação do shield
-  └── H3-2 (COM) → GND
+ESP32-S3
+  ├── GPIO startPin (out) ──── H3-7 (START IN)          [pulso de crédito]
+  ├── GPIO availPin (in)  ──── H3-4 (AVAIL OUT col)     [pull-up interno ~45kΩ]
+  ├── GND               ──── H3-5 (AVAIL EMIT) + H3-2 (COM)
+  └── GPIO relayPin (out) ── relé 30A                   [modo Convencional]
 
 Leitura AVAIL OUT: LOW=livre, HIGH=ocupada
-Confirmação de sucesso: AVAIL OUT transita de LOW → HIGH após pulso
+Confirmação de sucesso: AVAIL OUT transita de LOW → HIGH após pulso (janela 800ms)
 ```
 
 ---
 
 ## 10. Referências
 
-ito]
-  ├── GPIO (in)  ← pull-up 10kΩ → 3.3V ← H3-4 (AVAIL OUT)  [status]
-  ├── H3-3 (+5V) → alimentação do shield
-  └── H3-2 (COM) → GND
-
-Leitura AVAIL OUT: LOW=livre, HIGH=ocupada
-Confirmação de sucesso: AVAIL OUT transita de LOW → HIGH após pulso
-```
-
----
-
-## Referências
 - Manual elétrico: ALPM-39201 (Alliance Laundry Systems)
 - Manual programação Quantum: 204370ENR1 (janeiro 2019)
 - Schematic AP1/AP2: 807300 (Control Option Wiring Diagram Commercial FLW)
+
+---
+
+## 11. Plano — Detecção de Uso por Ficha (Token)
+
+Objetivo: permitir uso paralelo de ficha física na Speed Queen ao mesmo tempo que nosso
+sistema está ativo. Quando alguém insere uma ficha, o IOT detecta a mudança externa do
+AVAIL e notifica o backend, que expõe o estado `token_in_use` para o frontend.
+
+### 11.1 Princípio
+
+Condição de ativação externa (ficha): AVAIL transita LOW→HIGH **sem** que o `creditTick`
+estivesse ativo (`creditState == CR_IDLE`). Significa que a máquina foi ligada por fora
+do nosso sistema.
+
+Nenhuma mudança de banco de dados necessária. Estado mantido em memória no backend.
+Frontend recebe `token_in_use` no poll existente de 30s — sem chamadas extras.
+
+### 11.2 Firmware (`esp32s3.ino` e `esp32c3.ino` — mesma mudança nos dois)
+
+Em `readAvailTick()`, salvar o estado anterior **antes** de atualizar e emitir mensagens
+na transição quando `availEnabled && creditState == CR_IDLE`:
+
+```cpp
+void readAvailTick() {
+  int reading = digitalRead(availPin);
+  if (reading != availReading) {
+    availReading = reading;
+    availLastMs  = millis();
+  }
+  if (reading != availStable && (millis() - availLastMs) >= AVAIL_DEBOUNCE_MS) {
+    int prevStable = availStable;          // salva antes de atualizar
+    availStable     = reading;
+    availStableAtMs = millis();
+
+    // Ativação/desativação externa (ficha): availEnabled garante pino físico conectado;
+    // creditState == CR_IDLE garante que não foi o nosso servidor quem ativou.
+    if (availEnabled && isWebSocketConnected && creditState == CR_IDLE) {
+      if (prevStable == LOW  && availStable == HIGH) webSocket.sendTXT("TokenInserted");
+      else if (prevStable == HIGH && availStable == LOW)  webSocket.sendTXT("TokenFinished");
+    }
+  }
+}
+```
+
+**Mensagens novas no protocolo WS (ESP32-S3 e ESP32-C3, texto):**
+
+| Mensagem | Quando | Condição |
+|----------|--------|----------|
+| `"TokenInserted"` | AVAIL LOW→HIGH externo | `availEnabled && creditState==CR_IDLE` |
+| `"TokenFinished"` | AVAIL HIGH→LOW externo | `availEnabled && creditState==CR_IDLE` |
+
+> **Nota de reconexão:** o firmware só envia na *transição*. Se o WS desconecta enquanto
+> a ficha está rodando e reconecta depois, o backend perde o evento. Mitigation MVP:
+> limpar o estado de token no reconect (conservativo — mostra Livre até próxima ficha).
+> Post-MVP: backend envia 0x05 na reconexão para verificar AVAIL atual.
+
+### 11.3 Backend — `websocket.js`
+
+```js
+// Novo Set em memória (junto com disconnectTimers, etc.)
+const tokenInUseNodes = new Set(); // nodeIds com ficha ativa
+
+// Em ws.on('message'), adicionar após o bloco OTA:
+} else if (messageString === 'TokenInserted') {
+  const nodeId = getConnectionNodeId(ws);
+  if (nodeId !== 'unknown') {
+    tokenInUseNodes.add(nodeId);
+    console.log(`[WS] TokenInserted: nodeId=${nodeId}`);
+  }
+} else if (messageString === 'TokenFinished') {
+  const nodeId = getConnectionNodeId(ws);
+  if (nodeId !== 'unknown') {
+    tokenInUseNodes.delete(nodeId);
+    console.log(`[WS] TokenFinished: nodeId=${nodeId}`);
+  }
+}
+
+// No bloco ID:/NID: (reconexão do device), antes de cancelDisconnectLog:
+tokenInUseNodes.delete(nodeId); // reconexão = estado fresco
+
+// Nova função exportada:
+function isTokenInUse(nodeId) {
+  return tokenInUseNodes.has(nodeId);
+}
+// + adicionar ao module.exports
+```
+
+### 11.4 Backend — `machinesController.js`
+
+Em `getMachinesByBuilding()`, dentro do `map` de `enrichedMachines`:
+
+```js
+const { isTokenInUse } = require('../websocket');
+
+// junto com machine.isConnected = ...
+machine.token_in_use = isTokenInUse(machine.idNodemcu) ? 1 : 0;
+```
+
+### 11.5 Frontend — `machines.ts`
+
+```ts
+token_in_use?: number;  // 1 = em uso por ficha (não via nosso sistema)
+```
+
+### 11.6 Frontend — `disponibilidade-maquinas.component.ts`
+
+Novo helper:
+```ts
+isTokenInUse(machine: Machine): boolean {
+  return !!machine.token_in_use && !machine.is_in_use;
+}
+```
+
+Métodos a atualizar (adicionar `if (this.isTokenInUse(m))` antes do `is_in_use` genérico):
+
+| Método | Retorno para ficha |
+|--------|-------------------|
+| `getStatusLabel()` | `'Em uso (ficha)'` |
+| `getStatusClass()` | `'in-use-token'` |
+| `getStatusIcon()` | `'toll'` |
+| `getSubtitle()` | `'Máquina em uso por ficha'` |
+| `isAvailable()` | adicionar `&& !machine.token_in_use` |
+| `isCycleAnimating()` | não anima (sem `end_time`) |
+
+Adicionar CSS class `in-use-token` no `.css` (sugestão: cor âmbar, similar ao agendamento).
+
+### 11.7 Fluxo completo
+
+```
+Ficha inserida
+  → Speed Queen: AVAIL OUT LOW → HIGH
+  → ESP (readAvailTick, debounce 50ms, creditState=IDLE, availEnabled=true)
+  → ESP envia WS "TokenInserted"
+  → Backend: tokenInUseNodes.add(nodeId)
+  → Frontend poll 30s: machine.token_in_use = 1
+  → UI: "Em uso (ficha)" — ícone toll, cor âmbar, não clicável
+
+Ciclo termina / roupas retiradas
+  → AVAIL OUT HIGH → LOW
+  → ESP envia WS "TokenFinished"
+  → Backend: tokenInUseNodes.delete(nodeId)
+  → Frontend poll 30s: machine.token_in_use = 0
+  → UI: "Livre"
+```
