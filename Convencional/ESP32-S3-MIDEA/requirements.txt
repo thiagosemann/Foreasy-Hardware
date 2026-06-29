@@ -1,0 +1,3 @@
+midea-local
+aiohttp
+typing_extensions
