@@ -178,6 +178,17 @@ String otaPendingSha;
 bool     restartRequested = false;
 uint32_t restartAtMs      = 0;
 
+// ---------- Wizard: teste ao vivo de WiFi/WS (não-bloqueante) ----------
+// Durante um teste, suspendemos o WiFi/WS de produção (wifiTestActive) para o STA
+// poder testar credenciais candidatas sem comprometer a conexão salva.
+enum TestState : uint8_t { TST_IDLE, TST_RUN, TST_OK, TST_FAIL };
+TestState wifiTestState   = TST_IDLE;
+bool      wifiTestActive  = false;
+uint32_t  wifiTestStartMs = 0;
+const uint32_t WIFI_TEST_TIMEOUT_MS = 12000;
+String    wifiTestSsid, wifiTestPass;
+String    lastGoodSsid, lastGoodPass;   // última rede testada com sucesso (p/ o teste de WS)
+
 // ================= PULSO START IN =================
 // dispara pulso no startPin (START IN), ativo HIGH — igual esp32_avail
 void startPulse() {
@@ -370,6 +381,126 @@ void connectToWebSocket() {
   lastAppPingMs = 0;
   lastWSConnectAttemptMs = millis();
   Serial.printf("WS begin: %s:%u\n", wsHost.c_str(), wsPort);
+}
+
+// ================= TESTE AO VIVO (wizard) =================
+// Conecta o STA na rede candidata enquanto o AP segue de pé. Para reduzir a queda do
+// celular (rádio único), casa o canal do AP com o da rede alvo antes de conectar.
+void startWifiTest(const String& ssid, const String& pass, int ch) {
+  wifiTestActive  = true;
+  wifiTestState   = TST_RUN;
+  wifiTestStartMs = millis();
+  wifiTestSsid = ssid; wifiTestPass = pass;
+  webSocket.disconnect();
+  isWebSocketConnected = false;
+  WiFi.disconnect(false);
+  delay(40);
+  if (ch >= 1 && ch <= 13) {
+    String apName = nodeId + "-AP";
+    WiFi.softAP(apName.c_str(), "12345678", ch, false);
+    WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
+    delay(60);
+  }
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  Serial.printf("TEST WiFi: SSID=%s ch=%d\n", ssid.c_str(), ch);
+}
+
+void wifiTestTick() {
+  if (wifiTestState != TST_RUN) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiTestState = TST_OK;
+    lastGoodSsid = wifiTestSsid;
+    lastGoodPass = wifiTestPass;
+    Serial.printf("TEST WiFi OK. IP=%s\n", WiFi.localIP().toString().c_str());
+  } else if ((millis() - wifiTestStartMs) > WIFI_TEST_TIMEOUT_MS) {
+    wifiTestState = TST_FAIL;
+    WiFi.disconnect(false);
+    Serial.println("TEST WiFi FAIL.");
+  }
+}
+
+// Lê exatamente `len` bytes do cliente até o deadline. Retorna true se completou.
+static bool wsReadN(WiFiClient* c, uint8_t* buf, size_t len, uint32_t deadline) {
+  size_t got = 0;
+  while (got < len && (int32_t)(deadline - millis()) > 0) {
+    if (c->available()) buf[got++] = (uint8_t)c->read();
+    else delay(2);
+  }
+  return got == len;
+}
+
+// Extrai o valor de uma chave "key":"valor" de um JSON simples (sem lib).
+static String jsonStr(const String& src, const char* key) {
+  String pat = String("\"") + key + "\":\"";
+  int i = src.indexOf(pat);
+  if (i < 0) return "";
+  i += pat.length();
+  int e = src.indexOf('"', i);
+  return (e < 0) ? "" : src.substring(i, e);
+}
+
+// Teste de WebSocket (síncrono): faz o handshake, envia "WhoAmI:<nodeId>" e lê a
+// resposta do servidor com o prédio/máquina (o backend responde "WhoAmI:{json}").
+// Garante WiFi reconectando na última rede testada, se necessário. Retorna true se
+// conectou (handshake 101); `found` indica se o servidor reconheceu o nodeId.
+bool testWsSync(const String& host, uint16_t port, const String& nodeId,
+                String& building, String& machine, bool& found) {
+  building = ""; machine = ""; found = false;
+
+  if (WiFi.status() != WL_CONNECTED && lastGoodSsid.length()) {
+    WiFi.begin(lastGoodSsid.c_str(), lastGoodPass.c_str());
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 8000) delay(50);
+  }
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClient       plain;
+  WiFiClientSecure sec; sec.setInsecure();
+  WiFiClient* c = (port == 443) ? (WiFiClient*)&sec : &plain;
+  c->setTimeout(5000);
+  if (!c->connect(host.c_str(), port)) return false;
+
+  c->printf("GET / HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            host.c_str());
+
+  String resp; uint32_t t0 = millis();
+  while (c->connected() && (millis() - t0) < 5000 && resp.length() < 512) {
+    while (c->available()) resp += (char)c->read();
+    if (resp.indexOf("\r\n\r\n") >= 0) break;
+    delay(5);
+  }
+  if (resp.indexOf("101") < 0) { c->stop(); return false; }   // não é endpoint WS
+
+  // Envia "WhoAmI:<nodeId>" como frame de texto mascarado (cliente DEVE mascarar).
+  String payload = "WhoAmI:" + nodeId;
+  size_t n = payload.length();
+  if (n < 126) {
+    uint8_t mk[4]  = { 0x21, 0x53, 0xAE, 0x42 };
+    uint8_t hdr[2] = { 0x81, (uint8_t)(0x80 | n) };
+    c->write(hdr, 2); c->write(mk, 4);
+    for (size_t i = 0; i < n; i++) { uint8_t b = (uint8_t)payload[i] ^ mk[i & 3]; c->write(&b, 1); }
+    c->flush();
+
+    // Lê o frame de resposta (texto, NÃO mascarado pelo servidor).
+    uint32_t deadline = millis() + 6000;
+    uint8_t h[2];
+    if (wsReadN(c, h, 2, deadline)) {
+      uint32_t plen = h[1] & 0x7F;
+      if (plen == 126) { uint8_t ext[2]; plen = wsReadN(c, ext, 2, deadline) ? (((uint32_t)ext[0] << 8) | ext[1]) : 0; }
+      String j; j.reserve(plen + 1);
+      for (uint32_t i = 0; i < plen; i++) { uint8_t b; if (!wsReadN(c, &b, 1, deadline)) break; j += (char)b; }
+      int br = j.indexOf("WhoAmI:");
+      if (br >= 0) {
+        String body = j.substring(br + 7);
+        found    = (body.indexOf("\"found\":true") >= 0);
+        building = jsonStr(body, "building");
+        machine  = jsonStr(body, "machine");
+      }
+    }
+  }
+  c->stop();
+  return true;
 }
 
 // ================= OTA (Over-The-Air) =================
@@ -660,6 +791,7 @@ void setup() {
 // ================= LOOP =================
 void loop() {
   server.handleClient();
+  wifiTestTick();
   wifiTick();
   wsTick();
   handleRelayTick();
@@ -676,6 +808,7 @@ void loop() {
 
 // ================= TICKS =================
 void wifiTick() {
+  if (wifiTestActive) return;   // STA é gerido pelo teste do wizard
   if (wifiConnecting) {
     if (WiFi.status() == WL_CONNECTED) {
       wifiConnecting = false;
@@ -697,6 +830,7 @@ void wifiTick() {
 }
 
 void wsTick() {
+  if (wifiTestActive) return;   // sem WS de produção durante um teste do wizard
   webSocket.loop();
 
   if (isWebSocketConnected) {
@@ -758,6 +892,13 @@ void apLifetimeTick() {
     WiFi.softAPdisconnect(true);
     apEnabled = false;
     lastConnectivityOkMs = millis();
+    // Se um teste do wizard ficou pendente (config abandonada), retoma a produção.
+    if (wifiTestActive) {
+      wifiTestActive = false;
+      wifiTestState  = TST_IDLE;
+      WiFi.disconnect(false);
+      if (hasSavedWiFi()) connectToWiFi_begin();
+    }
   }
 }
 
@@ -774,22 +915,53 @@ void wsRestartTick() {
 
 // ================= HTTP ROUTES =================
 void startWebServer() {
-  server.on("/",            handleRoot);            // redireciona para /config
-  server.on("/config",      handleConfigPage);
+  server.on("/",            handleRoot);            // landing: Wizard / Administrador
+  server.on("/wizard",      handleConfigPage);      // assistente passo a passo
+  server.on("/config",      handleConfigPage);      // alias (compat)
+  server.on("/admin",       handleAdminPage);       // edições pontuais
   server.on("/config-data", HTTP_GET,  handleConfigData);
   server.on("/info",        handleInfoPage);
   server.on("/scan",        HTTP_GET,  handleScan);
   server.on("/save",        HTTP_POST, handleSave);
   server.on("/status",      HTTP_GET,  handleStatusJson);
+  server.on("/test-wifi",        HTTP_GET, handleTestWifi);
+  server.on("/test-wifi-status", HTTP_GET, handleTestWifiStatus);
+  server.on("/test-ws",          HTTP_GET, handleTestWs);
   server.on("/resetwifi",   HTTP_GET,  handleResetWiFi);
   server.on("/restart",     HTTP_GET,  handleRestart);
   server.onNotFound(handleNotFound);
 }
 
-// ========== / ==========
+// ========== / (landing) ==========
 void handleRoot() {
-  server.sendHeader("Location", "/config", true);
-  server.send(302, "text/plain", "");
+  String html = R"rawliteral(
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Foreasy</title>
+<style>
+:root{--bg:#070b08;--cd:#0f1612;--bd:#1e3028;--ac:#00e676;--mu:#557060;--tx:#d4f5e0}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:radial-gradient(120% 80% at 50% -10%,#0d1a13 0%,var(--bg) 60%);color:var(--tx);font-family:ui-monospace,'SF Mono',monospace;min-height:100vh}
+header{padding:34px 20px 8px;text-align:center}
+.logo{color:var(--ac);font-size:26px;font-weight:700;letter-spacing:6px}
+.sub{color:var(--mu);font-size:10px;letter-spacing:2px;margin-top:4px;text-transform:uppercase}
+main{max-width:460px;margin:0 auto;padding:18px;display:flex;flex-direction:column;gap:14px}
+a.card{display:block;text-decoration:none;background:var(--cd);border:1px solid var(--bd);border-radius:10px;padding:22px 20px;transition:all .15s}
+a.card:hover{border-color:var(--ac);box-shadow:0 0 0 3px rgba(0,230,118,.1)}
+.ct{color:var(--ac);font-size:17px;font-weight:700;letter-spacing:1px}
+.cd{color:var(--mu);font-size:11px;line-height:1.6;margin-top:8px}
+.foot{margin-top:6px;text-align:center;font-size:11px}
+.foot a{color:var(--mu);text-decoration:none}.foot a:hover{color:var(--ac)}
+</style></head><body>
+<header><div class="logo">FOREASY</div><div class="sub">esp32-s3 · configuração</div></header>
+<main>
+  <a class="card" href="/wizard"><div class="ct">▶ Assistente (Wizard)</div><div class="cd">Configuração guiada passo a passo: testa o Wi-Fi e o servidor antes de salvar. Recomendado na primeira instalação.</div></a>
+  <a class="card" href="/admin"><div class="ct">⚙ Administrador</div><div class="cd">Editar configurações pontuais (Node ID, servidor, redes, pinos) sem refazer tudo.</div></a>
+  <div class="foot"><a href="/info">→ status do dispositivo (/info)</a></div>
+</main>
+</body></html>
+)rawliteral";
+  server.send(200, "text/html", html);
 }
 
 // ========== /config (wizard step-by-step) ==========
@@ -842,17 +1014,23 @@ select option{background:var(--cd)}
 .msg{margin-top:12px;font-size:12px;min-height:16px;color:var(--ac);text-align:center}
 .foot{margin-top:16px;text-align:center;font-size:11px}
 .foot a{color:var(--mu);text-decoration:none}.foot a:hover{color:var(--ac)}
+.tbtn{margin-top:14px}
+.ts{margin-top:9px;font-size:11px;line-height:1.5;min-height:14px;color:var(--mu)}
+.ts.ok{color:var(--ac)}.ts.err{color:var(--red)}.ts.run{color:var(--lb)}
+.advx{margin-top:12px}.advx a{color:var(--mu);font-size:11px;text-decoration:none;cursor:pointer}.advx a:hover{color:var(--ac)}
 </style></head><body>
-<header><div class="logo">FOREASY</div><div class="sub">configuração do dispositivo</div></header>
+<header><div class="logo">FOREASY</div><div class="sub">assistente de configuração</div></header>
 <main>
   <div class="steps">
-    <div class="pill cur" id="pill0"><b>1</b><span>Rede</span></div>
-    <div class="pill" id="pill1"><b>2</b><span>Servidor</span></div>
-    <div class="pill" id="pill2"><b>3</b><span>Pinos</span></div>
+    <div class="pill cur" id="pill0"><b>1</b><span>Rede 1</span></div>
+    <div class="pill" id="pill1"><b>2</b><span>Rede 2</span></div>
+    <div class="pill" id="pill2"><b>3</b><span>Servidor</span></div>
+    <div class="pill" id="pill3"><b>4</b><span>Pinos</span></div>
   </div>
   <div class="track"><div class="fill" id="bar"></div></div>
 
   <div class="card-wrap">
+    <!-- Passo 1: Rede 1 (obrigatória, testada) -->
     <div class="step on" id="step0">
       <div class="sec">Rede 1 — primária</div>
       <label>Redes encontradas</label>
@@ -861,28 +1039,41 @@ select option{background:var(--cd)}
       <input id="manual_ssid" placeholder="nome da rede">
       <label>Senha</label>
       <input id="pass" type="text" placeholder="vazio se aberta">
+      <button class="btn tbtn" id="t0">Testar conexão</button>
+      <div class="ts" id="ts0">Teste a rede para poder avançar.</div>
+    </div>
+
+    <!-- Passo 2: Rede 2 (opcional, com Pular) -->
+    <div class="step" id="step1">
       <div class="sec">Rede 2 — failover (opcional)</div>
+      <label>Redes encontradas</label>
       <select id="ssid2_scan"></select>
       <label>Ou SSID manual</label>
       <input id="ssid2" placeholder="opcional">
       <label>Senha</label>
       <input id="pass2" type="text" placeholder="opcional">
+      <button class="btn tbtn" id="t1">Testar conexão</button>
+      <div class="ts" id="ts1">Opcional — toque em <b>Pular</b> se não houver rede 2.</div>
+    </div>
+
+    <!-- Passo 3: Node ID + servidor (escondido) + teste WS -->
+    <div class="step" id="step2">
       <div class="sec">Identificação</div>
       <label>Node ID</label>
       <input id="nodeid" placeholder="ex: C00045">
+      <div class="advx"><a id="srvtoggle">⚙ Alterar servidor (avançado)</a></div>
+      <div id="srvbox" style="display:none">
+        <label>Host</label>
+        <input id="host" placeholder="frst-back-....herokuapp.com">
+        <label>Porta</label>
+        <input id="port" type="number" min="1" max="65535" placeholder="80">
+      </div>
+      <button class="btn tbtn" id="t2">Testar WebSocket</button>
+      <div class="ts" id="ts2">Testa a conexão com o servidor.</div>
     </div>
 
-    <div class="step" id="step1">
-      <div class="sec">Servidor — WebSocket</div>
-      <label>Host</label>
-      <input id="host" placeholder="ex: frst-back-....herokuapp.com">
-      <label>Porta</label>
-      <input id="port" type="number" min="1" max="65535" placeholder="80">
-      <div class="chk"><input id="wsrestart" type="checkbox"><label for="wsrestart">Reiniciar sozinho se ficar 1h sem WebSocket</label></div>
-      <div class="hint">O servidor é salvo na memória (NVS) e usado para a conexão WebSocket após reiniciar.</div>
-    </div>
-
-    <div class="step" id="step2">
+    <!-- Passo 4: Pinos -->
+    <div class="step" id="step3">
       <div class="sec">Pinos — Industrial</div>
       <label>GPIO START IN (pulso, ativo HIGH)</label>
       <input id="startPin" type="number" min="0" max="48">
@@ -895,14 +1086,16 @@ select option{background:var(--cd)}
 
   <div class="nav">
     <button class="btn ghost" id="back">Voltar</button>
+    <button class="btn ghost" id="skip" style="display:none">Pular</button>
     <button class="btn" id="next">Avançar</button>
   </div>
   <div class="msg" id="msg"></div>
-  <div class="foot"><a href="/info">→ status do dispositivo (/info)</a></div>
+  <div class="foot"><a href="/">← início</a> · <a href="/info">status (/info)</a></div>
 </main>
 <script>
 function qs(id){return document.getElementById(id);}
-const N=3; let cur=0;
+const N=4; let cur=0;
+let scanList=[], net1ok=false, wsdone=false;
 
 function paint(){
   for(let i=0;i<N;i++){
@@ -912,24 +1105,57 @@ function paint(){
   }
   qs('bar').style.width=(cur/(N-1)*100)+'%';
   qs('back').style.visibility=cur?'visible':'hidden';
+  qs('skip').style.display=(cur===1)?'block':'none';
   qs('next').textContent=cur===N-1?'Salvar e Reiniciar':'Avançar';
 }
-function msg(t){qs('msg').textContent=t;}
-function valid(){
-  if(cur===0){
-    let ss=qs('manual_ssid').value.trim()||qs('ssid').value;
-    if(!ss){msg('Selecione ou digite a rede 1');return false;}
-    if(!qs('nodeid').value.trim()){msg('Preencha o Node ID');return false;}
-  }
-  if(cur===1 && !qs('host').value.trim()){msg('Preencha o servidor');return false;}
-  msg('');return true;
+function msg(t){qs('msg').textContent=t||'';}
+function setTs(id,cls,txt){let e=qs(id);e.className='ts '+cls;e.textContent=txt;}
+function chFor(ssid){let f=scanList.find(x=>x.ssid===ssid);return f?f.ch:0;}
+
+// Teste de WiFi ao vivo: o ESP conecta de verdade; o celular pode cair do AP por
+// alguns segundos (rádio único) — usamos polling tolerante a falhas de fetch.
+function testWifi(ssidVal,passVal,tsId,cb){
+  if(!ssidVal){setTs(tsId,'err','Selecione ou digite a rede.');return;}
+  setTs(tsId,'run','Testando… o Wi-Fi do ESP pode cair alguns segundos — reconecte se precisar.');
+  fetch('/test-wifi?ssid='+encodeURIComponent(ssidVal)+'&pass='+encodeURIComponent(passVal)+'&ch='+chFor(ssidVal)).catch(()=>{});
+  let tries=0;
+  const poll=()=>{
+    fetch('/test-wifi-status').then(r=>r.json()).then(j=>{
+      if(j.state==='ok'){setTs(tsId,'ok','✓ Conectou! (RSSI '+j.rssi+' dBm)');cb(true);}
+      else if(j.state==='fail'){setTs(tsId,'err','✗ Não conectou. Confira a senha e tente de novo.');cb(false);}
+      else if(tries++<30){setTimeout(poll,1500);}
+      else{setTs(tsId,'err','✗ Tempo esgotado. Tente de novo.');cb(false);}
+    }).catch(()=>{ if(tries++<30) setTimeout(poll,1800); else {setTs(tsId,'err','✗ Sem resposta — reconecte ao Wi-Fi do ESP e tente de novo.');cb(false);} });
+  };
+  setTimeout(poll,1800);
 }
-function next(){ if(cur===N-1){return save();} if(!valid())return; cur++; paint(); }
-function back(){ if(cur>0){cur--; paint();} }
+
+function testWs(){
+  let host=qs('host').value.trim(), port=qs('port').value||80, nid=qs('nodeid').value.trim();
+  if(!nid){setTs('ts2','err','Preencha o Node ID antes de testar.');return;}
+  setTs('ts2','run','Testando servidor…');
+  fetch('/test-ws?host='+encodeURIComponent(host)+'&port='+port+'&nodeid='+encodeURIComponent(nid)).then(r=>r.json()).then(j=>{
+    wsdone=true;
+    if(j.ok && j.found) setTs('ts2','ok','✓ Conectado! Prédio: '+(j.building||'?')+' · Máquina: '+(j.machine||'?'));
+    else if(j.ok) setTs('ts2','err','⚠ Servidor OK, mas o Node ID "'+nid+'" não foi encontrado. Confira o Node ID.');
+    else setTs('ts2','err','✗ Não conectou ao servidor. Você pode avançar e revisar depois.');
+  }).catch(()=>{wsdone=true;setTs('ts2','err','✗ Falha no teste. Você pode avançar mesmo assim.');});
+}
+
+function next(){
+  if(cur===0 && !net1ok){msg('Teste a rede 1 antes de avançar.');return;}
+  if(cur===2 && !wsdone){msg('Teste o servidor antes de avançar.');return;}
+  msg('');
+  if(cur===N-1) return save();
+  cur++; paint();
+}
+function back(){ if(cur>0){cur--; paint(); msg('');} }
+
 function save(){
   let ss=qs('manual_ssid').value.trim()||qs('ssid').value;
   let ss2=qs('ssid2').value.trim()||qs('ssid2_scan').value;
-  msg('Salvando...');
+  if(!qs('nodeid').value.trim()){msg('Preencha o Node ID');return;}
+  msg('Salvando…');
   let b='ssid='+encodeURIComponent(ss)+
     '&pass='+encodeURIComponent(qs('pass').value)+
     '&ssid2='+encodeURIComponent(ss2)+
@@ -939,8 +1165,7 @@ function save(){
     '&port='+encodeURIComponent(qs('port').value||80)+
     '&startPin='+(qs('startPin').value||5)+
     '&availPin='+(qs('availPin').value||6)+
-    '&availEn='+(qs('availEn').checked?1:0)+
-    '&wsrestart='+(qs('wsrestart').checked?1:0);
+    '&availEn='+(qs('availEn').checked?1:0);
   fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b})
     .then(r=>r.text()).then(t=>{msg(t+' Reconecte ao Wi-Fi em ~5s.');})
     .catch(()=>msg('Falha ao salvar.'));
@@ -950,11 +1175,12 @@ function scan(retry){
   retry=retry||0;
   fetch('/scan').then(r=>r.json()).then(list=>{
     if(list.length===0&&retry<6){setTimeout(()=>scan(retry+1),2500);return;}
+    scanList=list;
     let s=qs('ssid'); s.innerHTML='';
     let s2=qs('ssid2_scan'); s2.innerHTML='<option value="">— nenhuma —</option>';
     list.forEach(i=>{
       let o=document.createElement('option'); o.value=i.ssid;
-      o.textContent=i.ssid+' · '+i.rssi+'dBm · '+encText(i.enc);
+      o.textContent=i.ssid+' · '+i.rssi+'dBm · ch'+i.ch+' · '+encText(i.enc);
       s.appendChild(o); s2.appendChild(o.cloneNode(true));
     });
   }).catch(()=>{if(retry<6)setTimeout(()=>scan(retry+1),2500);});
@@ -968,16 +1194,158 @@ window.onload=()=>{
     qs('startPin').value=d.startPin!=null?d.startPin:5;
     qs('availPin').value=d.availPin!=null?d.availPin:6;
     qs('availEn').checked=(d.availEn===1);
-    qs('wsrestart').checked=(d.wsrestart===1);
   }).catch(()=>{});
   scan();
+  qs('t0').onclick=()=>{net1ok=false;testWifi(qs('manual_ssid').value.trim()||qs('ssid').value,qs('pass').value,'ts0',(ok)=>{net1ok=ok;});};
+  qs('t1').onclick=()=>{testWifi(qs('ssid2').value.trim()||qs('ssid2_scan').value,qs('pass2').value,'ts1',()=>{});};
+  qs('t2').onclick=()=>{wsdone=false;testWs();};
+  qs('srvtoggle').onclick=()=>{let b=qs('srvbox');b.style.display=(b.style.display==='none')?'block':'none';};
   qs('next').onclick=next; qs('back').onclick=back;
+  qs('skip').onclick=()=>{if(cur===1){cur++;paint();msg('');}};
   paint();
 };
 </script>
 </body></html>
 )rawliteral";
   server.send(200, "text/html", html);
+}
+
+// ========== /admin (edições pontuais) ==========
+void handleAdminPage() {
+  String html = R"rawliteral(
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Foreasy — Admin</title>
+<style>
+:root{--bg:#070b08;--cd:#0f1612;--bd:#1e3028;--ac:#00e676;--ac2:#009e55;--tx:#d4f5e0;--mu:#557060;--lb:#4ade80;--ip:#0b130e;--red:#f87171}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:radial-gradient(120% 80% at 50% -10%,#0d1a13 0%,var(--bg) 60%);color:var(--tx);font-family:ui-monospace,'SF Mono',monospace;font-size:13px;min-height:100vh}
+header{padding:20px 20px 6px;text-align:center}
+.logo{color:var(--ac);font-size:22px;font-weight:700;letter-spacing:5px}
+.sub{color:var(--mu);font-size:10px;letter-spacing:2px;margin-top:3px;text-transform:uppercase}
+main{max-width:520px;margin:0 auto;padding:8px 16px 36px}
+.box{background:var(--cd);border:1px solid var(--bd);border-radius:8px;padding:14px;margin-top:12px}
+.sec{color:var(--lb);font-size:10px;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px}
+label{color:var(--mu);font-size:10px;letter-spacing:1px;text-transform:uppercase;display:block;margin:9px 0 4px}
+input,select{width:100%;background:var(--ip);color:var(--tx);border:1px solid var(--bd);border-radius:4px;padding:9px 11px;font-family:inherit;font-size:13px;outline:none}
+input:focus,select:focus{border-color:var(--ac)}
+select option{background:var(--cd)}
+.chk{display:flex;align-items:center;gap:10px;margin-top:10px}
+.chk input{width:15px;height:15px;accent-color:var(--ac)}
+.chk label{margin:0;font-size:12px;color:var(--tx);text-transform:none;letter-spacing:0}
+.btn{width:100%;margin-top:12px;padding:11px;border:none;border-radius:5px;font-family:inherit;font-size:12px;font-weight:700;letter-spacing:1px;cursor:pointer;text-transform:uppercase;background:var(--ac);color:#000}
+.btn:hover{background:var(--ac2);color:var(--tx)}
+.btn.ghost{background:transparent;border:1px solid var(--bd);color:var(--mu)}
+.btn.ghost:hover{border-color:var(--ac);color:var(--ac)}
+.btn.danger{background:transparent;border:1px solid var(--red);color:var(--red)}
+.btn.danger:hover{background:var(--red);color:#000}
+.row{display:flex;gap:8px}.row .btn{flex:1}
+.msg{margin-top:12px;font-size:12px;min-height:16px;color:var(--ac);text-align:center}
+.foot{margin-top:16px;text-align:center;font-size:11px}
+.foot a{color:var(--mu);text-decoration:none}.foot a:hover{color:var(--ac)}
+</style></head><body>
+<header><div class="logo">FOREASY</div><div class="sub">administrador</div></header>
+<main>
+  <div class="box">
+    <div class="sec">Node ID</div>
+    <input id="nodeid">
+    <button class="btn" id="bNode">Salvar Node ID</button>
+  </div>
+  <div class="box">
+    <div class="sec">Servidor (WebSocket)</div>
+    <label>Host</label><input id="host">
+    <label>Porta</label><input id="port" type="number" min="1" max="65535">
+    <button class="btn" id="bSrv">Salvar servidor</button>
+  </div>
+  <div class="box">
+    <div class="sec">Rede 1</div>
+    <label>Redes</label><select id="ssid"></select>
+    <label>Ou SSID manual</label><input id="m1">
+    <label>Senha</label><input id="p1" type="text">
+    <button class="btn" id="bN1">Salvar rede 1</button>
+  </div>
+  <div class="box">
+    <div class="sec">Rede 2 (failover)</div>
+    <label>Redes</label><select id="ssid2"></select>
+    <label>Ou SSID manual</label><input id="m2">
+    <label>Senha</label><input id="p2" type="text">
+    <button class="btn" id="bN2">Salvar rede 2</button>
+  </div>
+  <div class="box">
+    <div class="sec">Pinos — Industrial</div>
+    <label>GPIO START IN</label><input id="startPin" type="number" min="0" max="48">
+    <label>GPIO AVAIL OUT</label><input id="availPin" type="number" min="0" max="48">
+    <div class="chk"><input id="availEn" type="checkbox"><label for="availEn">Fail-safe AVAIL</label></div>
+    <button class="btn" id="bPin">Salvar pinos</button>
+  </div>
+  <div class="box">
+    <div class="sec">Avançado</div>
+    <div class="chk"><input id="wsrestart" type="checkbox"><label for="wsrestart">Auto-restart se 1h sem WebSocket</label></div>
+    <button class="btn" id="bAdv">Salvar avançado</button>
+    <div class="row"><button class="btn ghost" id="bRst">Reiniciar</button><button class="btn danger" id="bClr">Apagar tudo</button></div>
+  </div>
+  <div class="msg" id="msg"></div>
+  <div class="foot"><a href="/">← início</a> · <a href="/wizard">assistente</a> · <a href="/info">/info</a></div>
+</main>
+<script>
+function qs(i){return document.getElementById(i);}
+function val(i){return qs(i).value.trim();}
+function msg(t){qs('msg').textContent=t;}
+function post(b){msg('Salvando…');fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b}).then(r=>r.text()).then(t=>msg(t)).catch(()=>msg('Falha.'));}
+function save(o){post(Object.keys(o).map(k=>k+'='+encodeURIComponent(o[k])).join('&'));}
+function scan(){fetch('/scan').then(r=>r.json()).then(l=>{['ssid','ssid2'].forEach(id=>{let s=qs(id);s.innerHTML='<option value="">— escolher —</option>';l.forEach(i=>{let o=document.createElement('option');o.value=i.ssid;o.textContent=i.ssid+' · '+i.rssi+'dBm';s.appendChild(o);});});}).catch(()=>{});}
+window.onload=()=>{
+  fetch('/config-data').then(r=>r.json()).then(d=>{
+    qs('nodeid').value=d.nodeid||''; qs('host').value=d.host||''; qs('port').value=d.port||80;
+    qs('startPin').value=d.startPin!=null?d.startPin:5; qs('availPin').value=d.availPin!=null?d.availPin:6;
+    qs('availEn').checked=(d.availEn===1); qs('wsrestart').checked=(d.wsrestart===1);
+  }).catch(()=>{});
+  scan();
+  qs('bNode').onclick=()=>{if(!val('nodeid')){msg('Preencha o Node ID');return;}save({nodeid:val('nodeid')});};
+  qs('bSrv').onclick=()=>{if(!val('host')){msg('Preencha o host');return;}save({host:val('host'),port:val('port')||80});};
+  qs('bN1').onclick=()=>{let s=val('m1')||val('ssid');if(!s){msg('Escolha a rede 1');return;}save({ssid:s,pass:qs('p1').value});};
+  qs('bN2').onclick=()=>{save({ssid2:(val('m2')||val('ssid2')),pass2:qs('p2').value});};
+  qs('bPin').onclick=()=>{save({startPin:val('startPin')||5,availPin:val('availPin')||6,availEn:(qs('availEn').checked?1:0)});};
+  qs('bAdv').onclick=()=>{save({wsrestart:(qs('wsrestart').checked?1:0)});};
+  qs('bRst').onclick=()=>{if(confirm('Reiniciar o dispositivo?')){msg('Reiniciando…');fetch('/restart');}};
+  qs('bClr').onclick=()=>{if(confirm('Apagar TODA a configuração e reiniciar?')){msg('Apagando…');fetch('/resetwifi');}};
+};
+</script>
+</body></html>
+)rawliteral";
+  server.send(200, "text/html", html);
+}
+
+// ========== Endpoints de teste do wizard ==========
+void handleTestWifi() {
+  String ssid = server.arg("ssid");
+  String pass = server.arg("pass");
+  int ch = server.hasArg("ch") ? server.arg("ch").toInt() : 0;
+  if (ssid.length() == 0) { server.send(400, "application/json", "{\"started\":false}"); return; }
+  startWifiTest(ssid, pass, ch);
+  server.send(200, "application/json", "{\"started\":true}");
+}
+
+void handleTestWifiStatus() {
+  const char* s = (wifiTestState == TST_OK) ? "ok" : (wifiTestState == TST_FAIL) ? "fail" : "testing";
+  int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+  server.send(200, "application/json", String("{\"state\":\"") + s + "\",\"rssi\":" + String(rssi) + "}");
+}
+
+void handleTestWs() {
+  String   host = server.hasArg("host") ? server.arg("host") : wsHost;
+  uint16_t port = server.hasArg("port") ? (uint16_t)server.arg("port").toInt() : wsPort;
+  String   nid  = server.hasArg("nodeid") ? server.arg("nodeid") : nodeId;
+  String building, machine; bool found = false;
+  bool ok = testWsSync(host, port, nid, building, machine, found);
+  // escapa para JSON (nomes podem ter aspas/contrabarra)
+  building.replace("\\", "\\\\"); building.replace("\"", "\\\"");
+  machine.replace("\\", "\\\\");  machine.replace("\"", "\\\"");
+  String json = String("{\"ok\":") + (ok ? "true" : "false")
+              + ",\"found\":" + (found ? "true" : "false")
+              + ",\"building\":\"" + building + "\""
+              + ",\"machine\":\""  + machine  + "\"}";
+  server.send(200, "application/json", json);
 }
 
 // ========== /config-data ==========
@@ -998,43 +1366,27 @@ void handleConfigData() {
   server.send(200, "application/json", json);
 }
 
-// ========== /save ==========
+// ========== /save (parcial: grava só os campos enviados) ==========
+// Usado pelo wizard (envia tudo) e pelo painel admin (envia subconjuntos).
 void handleSave() {
-  if (!server.hasArg("ssid") || !server.hasArg("nodeid")) {
-    server.send(400, "text/plain", "ssid e nodeid obrigatórios");
-    return;
-  }
+  bool any = false;
+  if (server.hasArg("ssid"))     { sSsid  = server.arg("ssid");  prefs.putString("ssid",   sSsid);  any = true; }
+  if (server.hasArg("pass"))     { sPass  = server.arg("pass");  prefs.putString("pass",   sPass);  any = true; }
+  if (server.hasArg("ssid2"))    { sSsid2 = server.arg("ssid2"); prefs.putString("ssid2",  sSsid2); any = true; }
+  if (server.hasArg("pass2"))    { sPass2 = server.arg("pass2"); prefs.putString("pass2",  sPass2); any = true; }
+  if (server.hasArg("nodeid"))   { nodeId = server.arg("nodeid"); prefs.putString("nodeid", nodeId); any = true; }
+  if (server.hasArg("host"))     { wsHost = server.arg("host");  prefs.putString("wsHost", wsHost); any = true; }
+  if (server.hasArg("port"))     { wsPort = (uint16_t)constrain(server.arg("port").toInt(), 1, 65535); prefs.putInt("wsPort", wsPort); any = true; }
+  if (server.hasArg("startPin")) { startPin = constrain(server.arg("startPin").toInt(), 0, 48); prefs.putInt("startPin", startPin); any = true; }
+  if (server.hasArg("availPin")) { availPin = constrain(server.arg("availPin").toInt(), 0, 48); prefs.putInt("availPin", availPin); any = true; }
+  if (server.hasArg("availEn"))  { availEnabled = server.arg("availEn").toInt() == 1; prefs.putInt("availEn", availEnabled ? 1 : 0); any = true; }
+  if (server.hasArg("wsrestart")){ wsRestartEnabled = server.arg("wsrestart").toInt() == 1; prefs.putInt("wsrestart", wsRestartEnabled ? 1 : 0); any = true; }
 
-  sSsid  = server.arg("ssid");
-  sPass  = server.arg("pass");
-  sSsid2 = server.arg("ssid2");
-  sPass2 = server.arg("pass2");
-  nodeId = server.arg("nodeid");
+  if (server.hasArg("ssid") || server.hasArg("ssid2")) wifiSlot = 0;  // volta p/ a rede 1 ao trocar WiFi
+  prefs.putUInt("bootCount", bootCount);
 
-  if (server.hasArg("host")) wsHost = server.arg("host");
-  if (server.hasArg("port")) wsPort = (uint16_t)constrain(server.arg("port").toInt(), 1, 65535);
-  if (server.hasArg("startPin")) startPin = constrain(server.arg("startPin").toInt(), 0, 48);
-  if (server.hasArg("availPin")) availPin = constrain(server.arg("availPin").toInt(), 0, 48);
-  availEnabled = server.hasArg("availEn") && server.arg("availEn").toInt() == 1;
-  wsRestartEnabled = server.hasArg("wsrestart") && server.arg("wsrestart").toInt() == 1;
-  wifiSlot = 0;
-
-  prefs.putString("ssid",      sSsid);
-  prefs.putString("pass",      sPass);
-  prefs.putString("ssid2",     sSsid2);
-  prefs.putString("pass2",     sPass2);
-  prefs.putString("nodeid",    nodeId);
-  prefs.putString("wsHost",    wsHost);
-  prefs.putInt("wsPort",       wsPort);
-  prefs.putInt("startPin",     startPin);
-  prefs.putInt("availPin",     availPin);
-  prefs.putInt("availEn",      availEnabled ? 1 : 0);
-  prefs.putInt("wsrestart",    wsRestartEnabled ? 1 : 0);
-  prefs.putUInt("bootCount",   bootCount);
-
-  server.send(200, "text/plain", "Configurado. Reiniciando...");
-  delay(400);
-  ESP.restart();
+  server.send(200, "text/plain", any ? "Configurado. Reiniciando..." : "Nada para salvar.");
+  if (any) { delay(400); ESP.restart(); }
 }
 
 // ========== /status ==========
@@ -1169,6 +1521,7 @@ void handleScan() {
     if (i > 0) json += ",";
     json += "{\"ssid\":\"" + WiFi.SSID(i) +
             "\",\"rssi\":"  + WiFi.RSSI(i) +
+            ",\"ch\":"      + WiFi.channel(i) +
             ",\"enc\":"     + (int)WiFi.encryptionType(i) + "}";
   }
   json += "]";

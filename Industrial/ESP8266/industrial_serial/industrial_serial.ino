@@ -152,6 +152,15 @@ static int  relayOffLevel = LOW;
 static bool     pulseActive = false;
 static uint32_t pulseEndMs  = 0;
 
+// ======================== Wizard: teste ao vivo de WiFi/WS ========================
+enum TestState : uint8_t { TST_IDLE, TST_RUN, TST_OK, TST_FAIL };
+static TestState wifiTestState   = TST_IDLE;
+static bool      wifiTestActive  = false;
+static uint32_t  wifiTestStartMs = 0;
+static const uint32_t WIFI_TEST_TIMEOUT_MS = 12000;
+static String    wifiTestSsid, wifiTestPass;
+static String    lastGoodSsid, lastGoodPass;
+
 // ======================== HTTP =========================
 ESP8266WebServer server(80);
 
@@ -665,153 +674,283 @@ static void connectToWebSocket() {
   if (apEnabled) log_append_line("WS iniciado (aguardando CONNECTED).");
 }
 
+// ======================== TESTE AO VIVO (wizard) ========================
+// Conecta o STA na rede candidata enquanto o AP segue de pé. Casa o canal do AP com
+// o da rede alvo para reduzir a queda do celular (rádio único do ESP8266).
+// Sem prints no Serial: a Serial é exclusiva do relé (STC15F104W).
+static void startWifiTest(const String& ssid, const String& pass, int ch) {
+  wifiTestActive  = true;
+  wifiTestState   = TST_RUN;
+  wifiTestStartMs = millis();
+  wifiTestSsid = ssid; wifiTestPass = pass;
+  webSocket.disconnect();
+  isWebSocketConnected = false;
+  WiFi.disconnect(false);
+  delay(40);
+  if (ch >= 1 && ch <= 13) {
+    char apName[40];
+    snprintf(apName, sizeof(apName), "%s-AP", P.nodeId[0] ? P.nodeId : "FOREASY");
+    WiFi.softAP(apName, "12345678", ch, false);
+    WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
+    delay(60);
+  }
+  WiFi.begin(ssid.c_str(), pass.c_str());
+}
+
+static void wifiTestTick() {
+  if (wifiTestState != TST_RUN) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiTestState = TST_OK;
+    lastGoodSsid = wifiTestSsid; lastGoodPass = wifiTestPass;
+  } else if ((millis() - wifiTestStartMs) > WIFI_TEST_TIMEOUT_MS) {
+    wifiTestState = TST_FAIL;
+    WiFi.disconnect(false);
+  }
+}
+
+static bool wsReadN(WiFiClient& c, uint8_t* buf, size_t len, uint32_t deadline) {
+  size_t got = 0;
+  while (got < len && (int32_t)(deadline - millis()) > 0) {
+    if (c.available()) buf[got++] = (uint8_t)c.read();
+    else delay(2);
+    yield();
+  }
+  return got == len;
+}
+
+static String jsonStrVal(const String& src, const char* key) {
+  String pat = String("\"") + key + "\":\"";
+  int i = src.indexOf(pat);
+  if (i < 0) return "";
+  i += pat.length();
+  int e = src.indexOf('"', i);
+  return (e < 0) ? "" : src.substring(i, e);
+}
+
+// Teste de WebSocket (síncrono): handshake → "WhoAmI:<nodeId>" → resposta com prédio/máquina.
+static bool testWsSync(const String& nodeId, String& building, String& machine, bool& found) {
+  building = ""; machine = ""; found = false;
+  if (WiFi.status() != WL_CONNECTED && lastGoodSsid.length()) {
+    WiFi.begin(lastGoodSsid.c_str(), lastGoodPass.c_str());
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 8000) { delay(50); yield(); }
+  }
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClient c;
+  c.setTimeout(5000);
+  if (!c.connect(WS_HOST, WS_PORT)) return false;
+
+  c.printf("GET / HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+           "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", WS_HOST);
+  String resp; uint32_t t0 = millis();
+  while (c.connected() && (millis() - t0) < 5000 && resp.length() < 512) {
+    while (c.available()) resp += (char)c.read();
+    if (resp.indexOf("\r\n\r\n") >= 0) break;
+    delay(5); yield();
+  }
+  if (resp.indexOf("101") < 0) { c.stop(); return false; }
+
+  String payload = "WhoAmI:" + nodeId;
+  size_t n = payload.length();
+  if (n < 126) {
+    uint8_t mk[4]  = { 0x21, 0x53, 0xAE, 0x42 };
+    uint8_t hdr[2] = { 0x81, (uint8_t)(0x80 | n) };
+    c.write(hdr, 2); c.write(mk, 4);
+    for (size_t i = 0; i < n; i++) { uint8_t b = (uint8_t)payload[i] ^ mk[i & 3]; c.write(&b, 1); }
+    c.flush();
+    uint32_t deadline = millis() + 6000;
+    uint8_t h[2];
+    if (wsReadN(c, h, 2, deadline)) {
+      uint32_t plen = h[1] & 0x7F;
+      if (plen == 126) { uint8_t ext[2]; plen = wsReadN(c, ext, 2, deadline) ? (((uint32_t)ext[0] << 8) | ext[1]) : 0; }
+      String j; j.reserve(plen + 1);
+      for (uint32_t i = 0; i < plen; i++) { uint8_t b; if (!wsReadN(c, &b, 1, deadline)) break; j += (char)b; }
+      int br = j.indexOf("WhoAmI:");
+      if (br >= 0) {
+        String body = j.substring(br + 7);
+        found    = (body.indexOf("\"found\":true") >= 0);
+        building = jsonStrVal(body, "building");
+        machine  = jsonStrVal(body, "machine");
+      }
+    }
+  }
+  c.stop();
+  return true;
+}
+
 // ======================== HTTP pages =========================
-static const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
-<!doctype html>
-<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Foreasy — Config</title>
+// Páginas (PROGMEM, servidas por send_P para poupar RAM no ESP-01S).
+static const char LANDING_PAGE[] PROGMEM = R"rawliteral(
+<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Foreasy</title>
 <style>
-:root{--bg:#0a0e0b;--cd:#111814;--bd:#1e3028;--ac:#00e676;--ac2:#009e55;--tx:#d4f5e0;--mu:#557060;--lb:#4ade80;--ip:#0d1710}
+:root{--bg:#070b08;--cd:#0f1612;--bd:#1e3028;--ac:#00e676;--mu:#557060;--tx:#d4f5e0}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--tx);font-family:ui-monospace,'Cascadia Code','SF Mono',monospace;font-size:13px}
-header{background:var(--cd);border-bottom:1px solid var(--bd);padding:14px 20px}
-.logo{color:var(--ac);font-size:18px;font-weight:700;letter-spacing:3px}
-.sub{color:var(--mu);font-size:10px;letter-spacing:1px;margin-top:2px}
-main{max-width:540px;margin:0 auto;padding:18px 16px 32px}
-.sec{color:var(--lb);font-size:10px;letter-spacing:2px;text-transform:uppercase;margin:22px 0 10px;padding-bottom:5px;border-bottom:1px solid var(--bd)}
-label{color:var(--mu);font-size:10px;letter-spacing:1px;text-transform:uppercase;display:block;margin:12px 0 4px}
-input,select{width:100%;background:var(--ip);color:var(--tx);border:1px solid var(--bd);border-radius:3px;padding:10px 12px;font-family:inherit;font-size:13px;outline:none;transition:border-color .15s}
-input:focus,select:focus{border-color:var(--ac)}
-select option{background:var(--cd)}
-.trow{display:flex;gap:8px;margin-top:8px}
-.tgl{flex:1;padding:11px 8px;border:1px solid var(--bd);border-radius:3px;cursor:pointer;text-align:center;background:var(--cd);color:var(--mu);font-size:12px;transition:all .15s;line-height:1.4}
-.tgl.active{background:#003d1a;border-color:var(--ac);color:var(--ac);font-weight:700}
-.tgl small{display:block;font-size:10px;opacity:.7;margin-top:2px}
-.chk{display:flex;align-items:center;gap:10px;margin-top:10px;padding:10px 12px;border:1px solid var(--bd);border-radius:3px;background:var(--cd)}
-.chk input[type=checkbox]{width:15px;height:15px;accent-color:var(--ac);flex-shrink:0}
-.chk label{margin:0;font-size:12px;color:var(--tx);text-transform:none;letter-spacing:0;cursor:pointer}
-.btn{display:block;width:100%;margin-top:22px;padding:13px;background:var(--ac);color:#000;border:none;border-radius:3px;font-family:inherit;font-size:13px;font-weight:700;letter-spacing:2px;cursor:pointer;text-transform:uppercase}
-.btn:hover{background:var(--ac2);color:var(--tx)}
-.st{margin-top:10px;font-size:12px;min-height:16px;color:var(--ac)}
-.lnk{margin-top:20px;display:flex;gap:16px;font-size:11px}
-.lnk a{color:var(--mu);text-decoration:none}
-.lnk a:hover{color:var(--ac)}
-</style>
-</head><body>
-<header>
-  <div class="logo">FOREASY</div>
-  <div class="sub">configuração do dispositivo</div>
-</header>
+body{background:radial-gradient(120% 80% at 50% -10%,#0d1a13 0%,var(--bg) 60%);color:var(--tx);font-family:ui-monospace,'SF Mono',monospace;min-height:100vh}
+header{padding:34px 20px 8px;text-align:center}.logo{color:var(--ac);font-size:26px;font-weight:700;letter-spacing:6px}.sub{color:var(--mu);font-size:10px;letter-spacing:2px;margin-top:4px;text-transform:uppercase}
+main{max-width:460px;margin:0 auto;padding:18px;display:flex;flex-direction:column;gap:14px}
+a.card{display:block;text-decoration:none;background:var(--cd);border:1px solid var(--bd);border-radius:10px;padding:22px 20px}
+a.card:hover{border-color:var(--ac)}.ct{color:var(--ac);font-size:17px;font-weight:700;letter-spacing:1px}.cd{color:var(--mu);font-size:11px;line-height:1.6;margin-top:8px}
+.foot{margin-top:6px;text-align:center;font-size:11px;line-height:2}.foot a{color:var(--mu);text-decoration:none;margin:0 6px}.foot a:hover{color:var(--ac)}
+</style></head><body>
+<header><div class="logo">FOREASY</div><div class="sub">esp8266 · configuração</div></header>
 <main>
-  <div class="sec">Rede 1 — primária</div>
-  <label>Scan de redes</label>
-  <select id="ssid"></select>
-  <label>SSID manual</label>
-  <input id="manual_ssid" placeholder="ou digita aqui">
-  <label>Senha</label>
-  <input id="pass" type="text" placeholder="vazio se rede aberta">
+<a class="card" href="/wizard"><div class="ct">▶ Assistente (Wizard)</div><div class="cd">Configuração guiada passo a passo: testa o Wi-Fi e o servidor antes de salvar.</div></a>
+<a class="card" href="/admin"><div class="ct">⚙ Administrador</div><div class="cd">Editar configurações pontuais (Node ID, redes, relé) sem refazer tudo.</div></a>
+<div class="foot"><a href="/info">/info</a><a href="/diagflash" target="_blank">/diagflash</a></div>
+</main></body></html>
+)rawliteral";
 
-  <div class="sec">Rede 2 — failover</div>
-  <small style="color:var(--mu);font-size:11px;display:block;margin-top:6px">Opcional. Alterna automaticamente se a rede 1 falhar.</small>
-  <label>SSID</label>
-  <input id="ssid2" placeholder="opcional">
-  <label>Senha</label>
-  <input id="pass2" type="text" placeholder="opcional">
-
-  <div class="sec">Dispositivo</div>
-  <label>Node ID</label>
-  <input id="nodeid" placeholder="ex: I00047">
-
-  <div class="chk">
-    <input id="invert" type="checkbox">
-    <label for="invert">Inverter lógica do relé (ON=LOW / OFF=HIGH)</label>
+static const char WIZARD_PAGE[] PROGMEM = R"rawliteral(
+<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Foreasy — Configuração</title>
+<style>
+:root{--bg:#070b08;--cd:#0f1612;--cd2:#0b110d;--bd:#1e3028;--ac:#00e676;--ac2:#009e55;--tx:#d4f5e0;--mu:#557060;--lb:#4ade80;--ip:#0b130e;--red:#f87171}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:radial-gradient(120% 80% at 50% -10%,#0d1a13 0%,var(--bg) 60%);color:var(--tx);font-family:ui-monospace,'SF Mono',monospace;font-size:13px;min-height:100vh}
+header{padding:20px 20px 8px;text-align:center}.logo{color:var(--ac);font-size:22px;font-weight:700;letter-spacing:5px}.sub{color:var(--mu);font-size:10px;letter-spacing:2px;margin-top:3px;text-transform:uppercase}
+main{max-width:560px;margin:0 auto;padding:6px 16px 36px}
+.steps{display:flex;gap:6px;margin:14px 0 6px}.pill{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;color:var(--mu);font-size:9px;letter-spacing:1px;text-transform:uppercase}
+.pill b{display:flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:50%;border:1px solid var(--bd);font-size:12px;background:var(--cd)}
+.pill.cur{color:var(--ac)}.pill.cur b{border-color:var(--ac);color:var(--ac)}.pill.done{color:var(--lb)}.pill.done b{border-color:var(--ac2);background:#04261447;color:var(--ac)}
+.track{height:2px;background:var(--bd);border-radius:2px;overflow:hidden;margin-bottom:18px}.fill{height:100%;width:0;background:linear-gradient(90deg,var(--ac2),var(--ac));transition:width .35s}
+.card-wrap{background:var(--cd);border:1px solid var(--bd);border-radius:8px;padding:18px 16px;min-height:220px}.step{display:none}.step.on{display:block}
+.sec{color:var(--lb);font-size:10px;letter-spacing:2px;text-transform:uppercase;margin:16px 0 8px;padding-bottom:5px;border-bottom:1px solid var(--bd)}.sec:first-child{margin-top:0}
+label{color:var(--mu);font-size:10px;letter-spacing:1px;text-transform:uppercase;display:block;margin:11px 0 4px}
+input,select{width:100%;background:var(--ip);color:var(--tx);border:1px solid var(--bd);border-radius:4px;padding:10px 12px;font-family:inherit;font-size:13px;outline:none}
+input:focus,select:focus{border-color:var(--ac)}select option{background:var(--cd)}
+.chk{display:flex;align-items:center;gap:10px;margin-top:12px;padding:10px 12px;border:1px solid var(--bd);border-radius:4px;background:var(--cd2)}.chk input{width:15px;height:15px;accent-color:var(--ac);flex-shrink:0}.chk label{margin:0;font-size:12px;color:var(--tx);text-transform:none;letter-spacing:0}
+.hint{color:var(--mu);font-size:10px;line-height:1.5;margin-top:10px;padding:8px 10px;border-left:2px solid var(--bd)}
+.nav{display:flex;gap:8px;margin-top:16px}.btn{flex:1;padding:13px;border:none;border-radius:5px;font-family:inherit;font-size:12px;font-weight:700;letter-spacing:2px;cursor:pointer;text-transform:uppercase;background:var(--ac);color:#000}.btn:hover{background:var(--ac2);color:var(--tx)}
+.btn.ghost{background:transparent;border:1px solid var(--bd);color:var(--mu);flex:0 0 110px}.btn.ghost:hover{border-color:var(--ac);color:var(--ac)}.tbtn{margin-top:14px;flex:1}
+.ts{margin-top:9px;font-size:11px;line-height:1.5;min-height:14px;color:var(--mu)}.ts.ok{color:var(--ac)}.ts.err{color:var(--red)}.ts.run{color:var(--lb)}
+.msg{margin-top:12px;font-size:12px;min-height:16px;color:var(--ac);text-align:center}.foot{margin-top:16px;text-align:center;font-size:11px}.foot a{color:var(--mu);text-decoration:none}.foot a:hover{color:var(--ac)}
+</style></head><body>
+<header><div class="logo">FOREASY</div><div class="sub">assistente de configuração</div></header>
+<main>
+  <div class="steps"><div class="pill cur" id="pill0"><b>1</b><span>Rede 1</span></div><div class="pill" id="pill1"><b>2</b><span>Rede 2</span></div><div class="pill" id="pill2"><b>3</b><span>Servidor</span></div><div class="pill" id="pill3"><b>4</b><span>Opções</span></div></div>
+  <div class="track"><div class="fill" id="bar"></div></div>
+  <div class="card-wrap">
+    <div class="step on" id="step0">
+      <div class="sec">Rede 1 — primária</div>
+      <label>Redes encontradas</label><select id="ssid"></select>
+      <label>Ou SSID manual</label><input id="manual_ssid" placeholder="nome da rede">
+      <label>Senha</label><input id="pass" type="text" placeholder="vazio se aberta">
+      <button class="btn tbtn" id="t0">Testar conexão</button>
+      <div class="ts" id="ts0">Teste a rede para poder avançar.</div>
+    </div>
+    <div class="step" id="step1">
+      <div class="sec">Rede 2 — failover (opcional)</div>
+      <label>Ou SSID manual</label><input id="ssid2" placeholder="opcional">
+      <label>Senha</label><input id="pass2" type="text" placeholder="opcional">
+      <button class="btn tbtn" id="t1">Testar conexão</button>
+      <div class="ts" id="ts1">Opcional — toque em <b>Pular</b> se não houver rede 2.</div>
+    </div>
+    <div class="step" id="step2">
+      <div class="sec">Identificação</div>
+      <label>Node ID</label><input id="nodeid" placeholder="ex: I00047">
+      <div class="hint">O servidor é fixo de fábrica. O teste confirma o prédio/máquina deste Node ID.</div>
+      <button class="btn tbtn" id="t2">Testar WebSocket</button>
+      <div class="ts" id="ts2">Testa a conexão com o servidor.</div>
+    </div>
+    <div class="step" id="step3">
+      <div class="sec">Opções do relé</div>
+      <div class="chk"><input id="invert" type="checkbox"><label for="invert">Inverter lógica do relé (NF, Normalmente Fechado)</label></div>
+      <div class="chk"><input id="wsrestart" type="checkbox"><label for="wsrestart">Auto-restart se ficar 1h sem WebSocket</label></div>
+    </div>
   </div>
-  <div class="chk">
-    <input id="wsrestart" type="checkbox">
-    <label for="wsrestart">Auto-restart se sem WebSocket por 1 hora</label>
-  </div>
-
-  <button class="btn" id="save">Salvar e Reiniciar</button>
-  <div class="st" id="status"></div>
-  <div class="lnk">
-    <a href="/info">→ /info</a>
-    <a href="/diagflash" target="_blank">→ /diagflash</a>
-  </div>
+  <div class="nav"><button class="btn ghost" id="back">Voltar</button><button class="btn ghost" id="skip" style="display:none">Pular</button><button class="btn" id="next">Avançar</button></div>
+  <div class="msg" id="msg"></div>
+  <div class="foot"><a href="/">← início</a> · <a href="/info">status (/info)</a></div>
 </main>
 <script>
-function qs(id){return document.getElementById(id);}
-
-function encText(enc){
-  if(enc===0) return 'Open';
-  if(enc===1) return 'WEP';
-  if(enc===2) return 'WPA-PSK';
-  if(enc===3) return 'WPA2-PSK';
-  if(enc===4) return 'WPA/WPA2-PSK';
-  return '?';
+function qs(i){return document.getElementById(i);}
+var N=4,cur=0,scanList=[],net1ok=false,wsdone=false;
+function paint(){for(var i=0;i<N;i++){qs('step'+i).classList.toggle('on',i===cur);qs('pill'+i).classList.toggle('done',i<cur);qs('pill'+i).classList.toggle('cur',i===cur);}qs('bar').style.width=(cur/(N-1)*100)+'%';qs('back').style.visibility=cur?'visible':'hidden';qs('skip').style.display=(cur===1)?'block':'none';qs('next').textContent=cur===N-1?'Salvar e Reiniciar':'Avançar';}
+function msg(t){qs('msg').textContent=t||'';}
+function setTs(id,c,t){var e=qs(id);e.className='ts '+c;e.textContent=t;}
+function chFor(s){for(var i=0;i<scanList.length;i++)if(scanList[i].ssid===s)return scanList[i].channel;return 0;}
+function testWifi(ssidVal,passVal,tsId,cb){
+  if(!ssidVal){setTs(tsId,'err','Selecione ou digite a rede.');return;}
+  setTs(tsId,'run','Testando… o Wi-Fi do ESP pode cair alguns segundos — reconecte se precisar.');
+  fetch('/test-wifi?ssid='+encodeURIComponent(ssidVal)+'&pass='+encodeURIComponent(passVal)+'&ch='+chFor(ssidVal)).catch(function(){});
+  var tries=0;var poll=function(){fetch('/test-wifi-status').then(function(r){return r.json();}).then(function(j){
+    if(j.state==='ok'){setTs(tsId,'ok','✓ Conectou! (RSSI '+j.rssi+' dBm)');cb(true);}
+    else if(j.state==='fail'){setTs(tsId,'err','✗ Não conectou. Confira a senha e tente de novo.');cb(false);}
+    else if(tries++<30){setTimeout(poll,1500);} else{setTs(tsId,'err','✗ Tempo esgotado. Tente de novo.');cb(false);}
+  }).catch(function(){if(tries++<30)setTimeout(poll,1800);else{setTs(tsId,'err','✗ Sem resposta — reconecte ao Wi-Fi do ESP e tente de novo.');cb(false);}});};
+  setTimeout(poll,1800);
 }
-
-function scan(retries){
-  retries=retries||0;
-  fetch('/scan').then(r=>r.json()).then(list=>{
-    let s=qs('ssid');
-    if(list.length===0&&retries<5){setTimeout(()=>scan(retries+1),3000);return;}
-    s.innerHTML='';
-    list.forEach(i=>{
-      let o=document.createElement('option');
-      o.value=i.ssid;
-      o.textContent=i.ssid+' | '+i.rssi+' dBm | CH '+i.channel+' | '+encText(i.enc);
-      s.appendChild(o);
-    });
-  }).catch(()=>{if(retries<5)setTimeout(()=>scan(retries+1),3000);});
-}
-
-window.onload=()=>{
-  fetch('/config-data').then(r=>r.json()).then(d=>{
-    qs('manual_ssid').value = d.ssid   || '';
-    qs('pass').value        = d.pass   || '';
-    qs('ssid2').value       = d.ssid2  || '';
-    qs('pass2').value       = d.pass2  || '';
-    qs('nodeid').value      = d.nodeid || '';
-    qs('invert').checked    = (d.invert    === 1);
-    qs('wsrestart').checked = (d.wsrestart === 1);
-  }).catch(()=>{});
-
+function testWs(){var nid=qs('nodeid').value.trim();if(!nid){setTs('ts2','err','Preencha o Node ID antes de testar.');return;}
+  setTs('ts2','run','Testando servidor…');
+  fetch('/test-ws?nodeid='+encodeURIComponent(nid)).then(function(r){return r.json();}).then(function(j){wsdone=true;
+    if(j.ok&&j.found)setTs('ts2','ok','✓ Conectado! Prédio: '+(j.building||'?')+' · Máquina: '+(j.machine||'?'));
+    else if(j.ok)setTs('ts2','err','⚠ Servidor OK, mas o Node ID "'+nid+'" não foi encontrado. Confira o Node ID.');
+    else setTs('ts2','err','✗ Não conectou ao servidor. Você pode avançar e revisar depois.');
+  }).catch(function(){wsdone=true;setTs('ts2','err','✗ Falha no teste. Você pode avançar mesmo assim.');});}
+function next(){if(cur===0&&!net1ok){msg('Teste a rede 1 antes de avançar.');return;}if(cur===2&&!wsdone){msg('Teste o servidor antes de avançar.');return;}msg('');if(cur===N-1)return save();cur++;paint();}
+function back(){if(cur>0){cur--;paint();msg('');}}
+function save(){var ss=qs('manual_ssid').value.trim()||qs('ssid').value;var ss2=qs('ssid2').value.trim();
+  if(!qs('nodeid').value.trim()){msg('Preencha o Node ID');return;}msg('Salvando…');
+  var b='ssid='+encodeURIComponent(ss)+'&pass='+encodeURIComponent(qs('pass').value)+'&ssid2='+encodeURIComponent(ss2)+'&pass2='+encodeURIComponent(qs('pass2').value)+'&nodeid='+encodeURIComponent(qs('nodeid').value.trim())+'&invert='+(qs('invert').checked?1:0)+'&wsrestart='+(qs('wsrestart').checked?1:0);
+  fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b}).then(function(r){return r.text();}).then(function(t){msg(t+' Reconecte ao Wi-Fi em ~5s.');}).catch(function(){msg('Falha ao salvar.');});}
+function encText(e){return['Open','WEP','WPA-PSK','WPA2-PSK','WPA/WPA2'][e]||'?';}
+function scan(retry){retry=retry||0;fetch('/scan').then(function(r){return r.json();}).then(function(list){if(list.length===0&&retry<6){setTimeout(function(){scan(retry+1);},2500);return;}scanList=list;var s=qs('ssid');s.innerHTML='';list.forEach(function(i){var o=document.createElement('option');o.value=i.ssid;o.textContent=i.ssid+' · '+i.rssi+'dBm · ch'+i.channel+' · '+encText(i.enc);s.appendChild(o);});}).catch(function(){if(retry<6)setTimeout(function(){scan(retry+1);},2500);});}
+window.onload=function(){
+  fetch('/config-data').then(function(r){return r.json();}).then(function(d){qs('manual_ssid').value=d.ssid||'';qs('pass').value=d.pass||'';qs('ssid2').value=d.ssid2||'';qs('pass2').value=d.pass2||'';qs('nodeid').value=d.nodeid||'';qs('invert').checked=(d.invert===1);qs('wsrestart').checked=(d.wsrestart===1);}).catch(function(){});
   scan();
-
-  qs('save').onclick=()=>{
-    let ss=qs('manual_ssid').value.trim() || qs('ssid').value;
-    let pw=qs('pass').value;
-    let ss2=qs('ssid2').value.trim();
-    let pw2=qs('pass2').value;
-    let id=qs('nodeid').value.trim();
-    let inv = qs('invert').checked ? '1' : '0';
-    let wsr = qs('wsrestart').checked ? '1' : '0';
-
-    if(!ss){ qs('status').textContent='Preencha o SSID da rede 1!'; return; }
-    if(!id){ qs('status').textContent='Preencha o NodeID!'; return; }
-
-    qs('status').textContent='Salvando...';
-
-    fetch('/save',{
-      method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:
-        'ssid='+encodeURIComponent(ss)+
-        '&pass='+encodeURIComponent(pw)+
-        '&ssid2='+encodeURIComponent(ss2)+
-        '&pass2='+encodeURIComponent(pw2)+
-        '&nodeid='+encodeURIComponent(id)+
-        '&invert='+encodeURIComponent(inv)+
-        '&wsrestart='+encodeURIComponent(wsr)
-    }).then(r=>r.text()).then(t=>{
-      qs('status').textContent=t;
-    }).catch(()=>{
-      qs('status').textContent='Falha ao salvar.';
-    });
-  };
+  qs('t0').onclick=function(){net1ok=false;testWifi(qs('manual_ssid').value.trim()||qs('ssid').value,qs('pass').value,'ts0',function(ok){net1ok=ok;});};
+  qs('t1').onclick=function(){testWifi(qs('ssid2').value.trim(),qs('pass2').value,'ts1',function(){});};
+  qs('t2').onclick=function(){wsdone=false;testWs();};
+  qs('next').onclick=next;qs('back').onclick=back;qs('skip').onclick=function(){if(cur===1){cur++;paint();msg('');}};
+  paint();
 };
-</script>
-</body></html>
+</script></body></html>
+)rawliteral";
+
+static const char ADMIN_PAGE[] PROGMEM = R"rawliteral(
+<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Foreasy — Admin</title>
+<style>
+:root{--bg:#070b08;--cd:#0f1612;--bd:#1e3028;--ac:#00e676;--ac2:#009e55;--tx:#d4f5e0;--mu:#557060;--lb:#4ade80;--ip:#0b130e;--red:#f87171}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:radial-gradient(120% 80% at 50% -10%,#0d1a13 0%,var(--bg) 60%);color:var(--tx);font-family:ui-monospace,'SF Mono',monospace;font-size:13px;min-height:100vh}
+header{padding:20px 20px 6px;text-align:center}.logo{color:var(--ac);font-size:22px;font-weight:700;letter-spacing:5px}.sub{color:var(--mu);font-size:10px;letter-spacing:2px;margin-top:3px;text-transform:uppercase}
+main{max-width:520px;margin:0 auto;padding:8px 16px 36px}.box{background:var(--cd);border:1px solid var(--bd);border-radius:8px;padding:14px;margin-top:12px}
+.sec{color:var(--lb);font-size:10px;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px}
+label{color:var(--mu);font-size:10px;letter-spacing:1px;text-transform:uppercase;display:block;margin:9px 0 4px}
+input,select{width:100%;background:var(--ip);color:var(--tx);border:1px solid var(--bd);border-radius:4px;padding:9px 11px;font-family:inherit;font-size:13px;outline:none}input:focus,select:focus{border-color:var(--ac)}select option{background:var(--cd)}
+.chk{display:flex;align-items:center;gap:10px;margin-top:10px}.chk input{width:15px;height:15px;accent-color:var(--ac)}.chk label{margin:0;font-size:12px;color:var(--tx);text-transform:none;letter-spacing:0}
+.btn{width:100%;margin-top:12px;padding:11px;border:none;border-radius:5px;font-family:inherit;font-size:12px;font-weight:700;letter-spacing:1px;cursor:pointer;text-transform:uppercase;background:var(--ac);color:#000}.btn:hover{background:var(--ac2);color:var(--tx)}
+.btn.ghost{background:transparent;border:1px solid var(--bd);color:var(--mu)}.btn.ghost:hover{border-color:var(--ac);color:var(--ac)}.btn.danger{background:transparent;border:1px solid var(--red);color:var(--red)}.btn.danger:hover{background:var(--red);color:#000}
+.row{display:flex;gap:8px}.row .btn{flex:1}.msg{margin-top:12px;font-size:12px;min-height:16px;color:var(--ac);text-align:center}.foot{margin-top:16px;text-align:center;font-size:11px}.foot a{color:var(--mu);text-decoration:none;margin:0 6px}.foot a:hover{color:var(--ac)}
+</style></head><body>
+<header><div class="logo">FOREASY</div><div class="sub">administrador · esp8266</div></header>
+<main>
+  <div class="box"><div class="sec">Node ID</div><input id="nodeid"><button class="btn" id="bNode">Salvar Node ID</button></div>
+  <div class="box"><div class="sec">Rede 1</div><label>Redes</label><select id="ssid"></select><label>Ou SSID manual</label><input id="m1"><label>Senha</label><input id="p1" type="text"><button class="btn" id="bN1">Salvar rede 1</button></div>
+  <div class="box"><div class="sec">Rede 2 (failover)</div><label>SSID manual</label><input id="m2"><label>Senha</label><input id="p2" type="text"><button class="btn" id="bN2">Salvar rede 2</button></div>
+  <div class="box"><div class="sec">Opções do relé</div><div class="chk"><input id="invert" type="checkbox"><label for="invert">Inverter lógica (NF)</label></div><div class="chk"><input id="wsrestart" type="checkbox"><label for="wsrestart">Auto-restart se 1h sem WS</label></div><button class="btn" id="bOpt">Salvar opções</button></div>
+  <div class="box"><div class="sec">Sistema</div><div class="row"><button class="btn ghost" id="bRst">Reiniciar</button><button class="btn danger" id="bClr">Apagar tudo</button></div></div>
+  <div class="msg" id="msg"></div>
+  <div class="foot"><a href="/">← início</a><a href="/wizard">assistente</a><a href="/info">/info</a></div>
+</main>
+<script>
+function qs(i){return document.getElementById(i);}
+function val(i){return qs(i).value.trim();}
+function msg(t){qs('msg').textContent=t;}
+function post(b){msg('Salvando…');fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b}).then(function(r){return r.text();}).then(function(t){msg(t);}).catch(function(){msg('Falha.');});}
+function save(o){post(Object.keys(o).map(function(k){return k+'='+encodeURIComponent(o[k]);}).join('&'));}
+function scan(){fetch('/scan').then(function(r){return r.json();}).then(function(l){var s=qs('ssid');s.innerHTML='<option value="">— escolher —</option>';l.forEach(function(i){var o=document.createElement('option');o.value=i.ssid;o.textContent=i.ssid+' · '+i.rssi+'dBm';s.appendChild(o);});}).catch(function(){});}
+window.onload=function(){
+  fetch('/config-data').then(function(r){return r.json();}).then(function(d){qs('nodeid').value=d.nodeid||'';qs('invert').checked=(d.invert===1);qs('wsrestart').checked=(d.wsrestart===1);}).catch(function(){});
+  scan();
+  qs('bNode').onclick=function(){if(!val('nodeid')){msg('Preencha o Node ID');return;}save({nodeid:val('nodeid')});};
+  qs('bN1').onclick=function(){var s=val('m1')||val('ssid');if(!s){msg('Escolha a rede 1');return;}save({ssid:s,pass:qs('p1').value});};
+  qs('bN2').onclick=function(){save({ssid2:val('m2'),pass2:qs('p2').value});};
+  qs('bOpt').onclick=function(){save({invert:(qs('invert').checked?1:0),wsrestart:(qs('wsrestart').checked?1:0)});};
+  qs('bRst').onclick=function(){if(confirm('Reiniciar o dispositivo?')){msg('Reiniciando…');fetch('/restart');}};
+  qs('bClr').onclick=function(){if(confirm('Apagar TODA a configuração e reiniciar?')){msg('Apagando…');fetch('/resetwifi');}};
+};
+</script></body></html>
 )rawliteral";
 
 // ======================== HTTP handlers =========================
@@ -834,12 +973,60 @@ static void handleConfigData() {
 }
 
 static void handleRoot() {
-  server.sendHeader("Location", "/config", true);
-  server.send(302, "text/plain", "");
+  server.send_P(200, "text/html", LANDING_PAGE);
 }
 
 static void handleConfigPage() {
-  server.send_P(200, "text/html", CONFIG_PAGE);
+  server.send_P(200, "text/html", WIZARD_PAGE);
+}
+
+static void handleAdminPage() {
+  server.send_P(200, "text/html", ADMIN_PAGE);
+}
+
+// ======================== Endpoints de teste do wizard ========================
+static void handleTestWifi() {
+  String ssid = server.arg("ssid");
+  String pass = server.arg("pass");
+  int ch = server.hasArg("ch") ? server.arg("ch").toInt() : 0;
+  if (ssid.length() == 0) { server.send(400, "application/json", "{\"started\":false}"); return; }
+  startWifiTest(ssid, pass, ch);
+  server.send(200, "application/json", "{\"started\":true}");
+}
+
+static void handleTestWifiStatus() {
+  const char* s = (wifiTestState == TST_OK) ? "ok" : (wifiTestState == TST_FAIL) ? "fail" : "testing";
+  int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+  char buf[64];
+  snprintf(buf, sizeof(buf), "{\"state\":\"%s\",\"rssi\":%d}", s, rssi);
+  server.send(200, "application/json", buf);
+}
+
+static void handleTestWs() {
+  String nid = server.hasArg("nodeid") ? server.arg("nodeid") : String(P.nodeId);
+  String building, machine; bool found = false;
+  bool ok = testWsSync(nid, building, machine, found);
+  building.replace("\\", "\\\\"); building.replace("\"", "\\\"");
+  machine.replace("\\", "\\\\");  machine.replace("\"", "\\\"");
+  String json = String("{\"ok\":") + (ok ? "true" : "false")
+              + ",\"found\":" + (found ? "true" : "false")
+              + ",\"building\":\"" + building + "\""
+              + ",\"machine\":\""  + machine  + "\"}";
+  server.send(200, "application/json", json);
+}
+
+static void handleRestart() {
+  server.send(200, "text/plain", "Reiniciando...");
+  delay(300);
+  ESP.restart();
+}
+
+static void handleResetWifi() {
+  persistDefaults();
+  persistSaveAndVerifyRetry(COMMIT_TRIES);
+  server.send(200, "text/plain", "Configuração apagada. Reiniciando...");
+  delay(400);
+  ESP.restart();
 }
 
 static void handleScan() {
@@ -1041,43 +1228,24 @@ static void handleInfoPage() {
   }
 }
 
+// /save parcial: grava só os campos enviados (wizard manda tudo; admin manda subconjuntos).
 static void handleSave() {
-  if (!server.hasArg("ssid") || !server.hasArg("nodeid")) {
-    server.send(400, "text/plain", "ssid and nodeid required");
-    return;
-  }
+  bool any = false;
+  if (server.hasArg("ssid"))      { memset(P.ssid,  0, sizeof(P.ssid));   server.arg("ssid").toCharArray(P.ssid,   sizeof(P.ssid));   any = true; }
+  if (server.hasArg("pass"))      { memset(P.pass,  0, sizeof(P.pass));   server.arg("pass").toCharArray(P.pass,   sizeof(P.pass));   any = true; }
+  if (server.hasArg("ssid2"))     { memset(P.ssid2, 0, sizeof(P.ssid2));  server.arg("ssid2").toCharArray(P.ssid2, sizeof(P.ssid2));  any = true; }
+  if (server.hasArg("pass2"))     { memset(P.pass2, 0, sizeof(P.pass2));  server.arg("pass2").toCharArray(P.pass2, sizeof(P.pass2));  any = true; }
+  if (server.hasArg("nodeid"))    { memset(P.nodeId,0, sizeof(P.nodeId)); server.arg("nodeid").toCharArray(P.nodeId,sizeof(P.nodeId)); any = true; }
+  if (server.hasArg("invert"))    { P.relayInvert      = server.arg("invert").toInt()    ? 1 : 0; any = true; }
+  if (server.hasArg("wsrestart")) { P.wsRestartEnabled = server.arg("wsrestart").toInt() ? 1 : 0; any = true; }
 
-  String ssidS  = server.arg("ssid");
-  String passS  = server.arg("pass");
-  String ssid2S = server.arg("ssid2");
-  String pass2S = server.arg("pass2");
-  String nidS   = server.arg("nodeid");
-
-  uint8_t inv  = (server.hasArg("invert") ? (uint8_t)server.arg("invert").toInt() : 0);
-  uint8_t wsr  = (server.hasArg("wsrestart") ? (uint8_t)server.arg("wsrestart").toInt() : 0);
-
-  memset(P.ssid,  0, sizeof(P.ssid));
-  memset(P.pass,  0, sizeof(P.pass));
-  memset(P.ssid2, 0, sizeof(P.ssid2));
-  memset(P.pass2, 0, sizeof(P.pass2));
-  memset(P.nodeId, 0, sizeof(P.nodeId));
-
-  ssidS.toCharArray(P.ssid,   sizeof(P.ssid));
-  passS.toCharArray(P.pass,   sizeof(P.pass));
-  ssid2S.toCharArray(P.ssid2, sizeof(P.ssid2));
-  pass2S.toCharArray(P.pass2, sizeof(P.pass2));
-  nidS.toCharArray(P.nodeId,  sizeof(P.nodeId));
+  if (!any) { server.send(200, "text/plain", "Nada para salvar."); return; }
 
   P.magic = EEPROM_MAGIC;
   P.ver   = EEPROM_VER;
+  P.machineMode = 1;  // sempre industrial
+  if (server.hasArg("ssid") || server.hasArg("ssid2")) wifiSlot = 0;
 
-  P.machineMode      = 1;  // sempre industrial
-  P.relayInvert      = (inv  == 0) ? 0 : 1;
-  P.wsRestartEnabled = (wsr  == 0) ? 0 : 1;
-
-  wifiSlot = 0; // sempre começa pela rede 1 após salvar
-
-  // aplica em runtime (antes do restart)
   applyPersistRuntime();
 
   server.send(200, "text/plain", "Salvando... aguarde reinicio.");
@@ -1086,27 +1254,18 @@ static void handleSave() {
 
   webSocket.disconnect();
   delay(80);
-
   WiFi.disconnect(false);
   delay(120);
   yield();
 
   if (DEBUG_EEPROM_SECTORINFO) debugEepromSectorInfo();
-
-  if (ERASE_SECTOR_BEFORE_SAVE) {
-    diagEraseEepromSector();
-    delay(50);
-    yield();
-  }
+  if (ERASE_SECTOR_BEFORE_SAVE) { diagEraseEepromSector(); delay(50); yield(); }
 
   persistSaveAndVerifyRetry(COMMIT_TRIES);
-
   EEPROM.end();
   delay(250);
   yield();
-
   delay(200);
-
   ESP.restart();
 }
 
@@ -1114,11 +1273,18 @@ static void handleNotFound() { server.send(404, "text/plain", "Not found"); }
 
 static void startWebServer() {
   server.on("/", HTTP_GET, handleRoot);
+  server.on("/wizard", HTTP_GET, handleConfigPage);
   server.on("/config", HTTP_GET, handleConfigPage);
+  server.on("/admin", HTTP_GET, handleAdminPage);
   server.on("/config-data", HTTP_GET, handleConfigData);
   server.on("/info", HTTP_GET, handleInfoPage);
   server.on("/scan", HTTP_GET, handleScan);
   server.on("/save", HTTP_POST, handleSave);
+  server.on("/test-wifi", HTTP_GET, handleTestWifi);
+  server.on("/test-wifi-status", HTTP_GET, handleTestWifiStatus);
+  server.on("/test-ws", HTTP_GET, handleTestWs);
+  server.on("/restart", HTTP_GET, handleRestart);
+  server.on("/resetwifi", HTTP_GET, handleResetWifi);
   server.on("/diagflash", HTTP_GET, handleDiagFlash);
   server.onNotFound(handleNotFound);
   server.begin();
@@ -1144,6 +1310,7 @@ static void updateLedTick() {
 }
 
 static void wifiTick() {
+  if (wifiTestActive) return;   // STA é gerido pelo teste do wizard
   if (wifiConnecting) {
     if (WiFi.status() == WL_CONNECTED) {
       wifiConnecting = false;
@@ -1174,6 +1341,7 @@ static void wifiTick() {
 }
 
 static void wsTick() {
+  if (wifiTestActive) return;   // sem WS de produção durante um teste do wizard
   webSocket.loop();
 
   if (isWebSocketConnected && (millis() - lastAppPingMs) > APP_PING_INTERVAL_MS) {
@@ -1237,6 +1405,12 @@ static void apLifetimeTick() {
     apEnabled = false;
     logBuffer[0] = '\0';
     lastConnectivityOkMs = millis();
+    if (wifiTestActive) {   // config abandonada: retoma a produção
+      wifiTestActive = false;
+      wifiTestState  = TST_IDLE;
+      WiFi.disconnect(false);
+      if (hasSavedWiFi()) connectToWiFi_begin();
+    }
   }
 }
 
@@ -1313,6 +1487,7 @@ void loop() {
 
   if (apEnabled) server.handleClient();
 
+  wifiTestTick();
   handleRelayTick();
   wifiTick();
   wsTick();
