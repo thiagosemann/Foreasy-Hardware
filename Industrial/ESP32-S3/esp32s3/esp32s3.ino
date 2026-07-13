@@ -38,7 +38,7 @@
 // - Credenciais NUNCA apagadas por falha de conexão
 //
 // WEBSOCKET:
-// - Servidor (host/porta) configurável via /config e salvo na NVS
+// - Servidor (host/porta) configurável apenas via /admin e salvo na NVS
 // - Backoff exponencial: 10s base → 120s máximo
 // - Watchdog WS down  : sem WS por >5min  → failover WiFi+WS
 // - Watchdog global   : sem WiFi+WS >8min → failover
@@ -1017,7 +1017,6 @@ select option{background:var(--cd)}
 .tbtn{margin-top:14px}
 .ts{margin-top:9px;font-size:11px;line-height:1.5;min-height:14px;color:var(--mu)}
 .ts.ok{color:var(--ac)}.ts.err{color:var(--red)}.ts.run{color:var(--lb)}
-.advx{margin-top:12px}.advx a{color:var(--mu);font-size:11px;text-decoration:none;cursor:pointer}.advx a:hover{color:var(--ac)}
 </style></head><body>
 <header><div class="logo">FOREASY</div><div class="sub">assistente de configuração</div></header>
 <main>
@@ -1056,18 +1055,12 @@ select option{background:var(--cd)}
       <div class="ts" id="ts1">Opcional — toque em <b>Pular</b> se não houver rede 2.</div>
     </div>
 
-    <!-- Passo 3: Node ID + servidor (escondido) + teste WS -->
+    <!-- Passo 3: Node ID + teste WS (servidor só é alterável no /admin) -->
     <div class="step" id="step2">
       <div class="sec">Identificação</div>
       <label>Node ID</label>
       <input id="nodeid" placeholder="ex: C00045">
-      <div class="advx"><a id="srvtoggle">⚙ Alterar servidor (avançado)</a></div>
-      <div id="srvbox" style="display:none">
-        <label>Host</label>
-        <input id="host" placeholder="frst-back-....herokuapp.com">
-        <label>Porta</label>
-        <input id="port" type="number" min="1" max="65535" placeholder="80">
-      </div>
+      <div class="hint">O servidor vem configurado de fábrica (alterável só no Administrador). O teste confirma o prédio/máquina deste Node ID.</div>
       <button class="btn tbtn" id="t2">Testar WebSocket</button>
       <div class="ts" id="ts2">Testa a conexão com o servidor.</div>
     </div>
@@ -1131,10 +1124,10 @@ function testWifi(ssidVal,passVal,tsId,cb){
 }
 
 function testWs(){
-  let host=qs('host').value.trim(), port=qs('port').value||80, nid=qs('nodeid').value.trim();
+  let nid=qs('nodeid').value.trim();
   if(!nid){setTs('ts2','err','Preencha o Node ID antes de testar.');return;}
   setTs('ts2','run','Testando servidor…');
-  fetch('/test-ws?host='+encodeURIComponent(host)+'&port='+port+'&nodeid='+encodeURIComponent(nid)).then(r=>r.json()).then(j=>{
+  fetch('/test-ws?nodeid='+encodeURIComponent(nid)).then(r=>r.json()).then(j=>{
     wsdone=true;
     if(j.ok && j.found) setTs('ts2','ok','✓ Conectado! Prédio: '+(j.building||'?')+' · Máquina: '+(j.machine||'?'));
     else if(j.ok) setTs('ts2','err','⚠ Servidor OK, mas o Node ID "'+nid+'" não foi encontrado. Confira o Node ID.');
@@ -1161,8 +1154,6 @@ function save(){
     '&ssid2='+encodeURIComponent(ss2)+
     '&pass2='+encodeURIComponent(qs('pass2').value)+
     '&nodeid='+encodeURIComponent(qs('nodeid').value.trim())+
-    '&host='+encodeURIComponent(qs('host').value.trim())+
-    '&port='+encodeURIComponent(qs('port').value||80)+
     '&startPin='+(qs('startPin').value||5)+
     '&availPin='+(qs('availPin').value||6)+
     '&availEn='+(qs('availEn').checked?1:0);
@@ -1190,7 +1181,6 @@ window.onload=()=>{
     qs('manual_ssid').value=d.ssid||''; qs('pass').value=d.pass||'';
     qs('ssid2').value=d.ssid2||''; qs('pass2').value=d.pass2||'';
     qs('nodeid').value=d.nodeid||'';
-    qs('host').value=d.host||''; qs('port').value=d.port||80;
     qs('startPin').value=d.startPin!=null?d.startPin:5;
     qs('availPin').value=d.availPin!=null?d.availPin:6;
     qs('availEn').checked=(d.availEn===1);
@@ -1199,7 +1189,6 @@ window.onload=()=>{
   qs('t0').onclick=()=>{net1ok=false;testWifi(qs('manual_ssid').value.trim()||qs('ssid').value,qs('pass').value,'ts0',(ok)=>{net1ok=ok;});};
   qs('t1').onclick=()=>{testWifi(qs('ssid2').value.trim()||qs('ssid2_scan').value,qs('pass2').value,'ts1',()=>{});};
   qs('t2').onclick=()=>{wsdone=false;testWs();};
-  qs('srvtoggle').onclick=()=>{let b=qs('srvbox');b.style.display=(b.style.display==='none')?'block':'none';};
   qs('next').onclick=next; qs('back').onclick=back;
   qs('skip').onclick=()=>{if(cur===1){cur++;paint();msg('');}};
   paint();

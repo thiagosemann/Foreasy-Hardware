@@ -39,7 +39,7 @@
 //
 // ARMAZENAMENTO: Preferences (NVS)
 //   ssid, pass, ssid2, pass2, nodeid, relayMode, relayInvert,
-//   wsrestart, bootCount
+//   wsHost, wsPort, wsrestart, bootCount
 //   bootCount incrementado em RAM; salvo apenas no /save
 //
 // SCAN WIFI: assíncrono | TEMPERATURA: temprature_sens_read()
@@ -102,8 +102,9 @@ const uint32_t WIFI_RETRY_INTERVAL_MS  = 5000;
 uint32_t lastWiFiAttemptMs = 0;
 
 // ---------- WebSocket ----------
-const uint16_t wsPort = 80;
-const char*    wsHost = "frst-back-02b607761078.herokuapp.com";
+// Servidor configurável pelo painel /admin (persistido na NVS)
+uint16_t wsPort = 80;
+String   wsHost = "frst-back-02b607761078.herokuapp.com";
 bool isWebSocketConnected = false;
 
 // ---------- WS backoff ----------
@@ -225,6 +226,8 @@ void loadPrefs() {
   sPass            = prefs.getString("pass",        "");
   sSsid2           = prefs.getString("ssid2",       "");
   sPass2           = prefs.getString("pass2",       "");
+  wsHost           = prefs.getString("wsHost",      wsHost);
+  wsPort           = (uint16_t)prefs.getInt("wsPort", wsPort);
   relayMode        = prefs.getInt("relayMode",      0);
   relayInvert      = (prefs.getInt("relayInvert",   0) != 0);
   wsRestartEnabled = (prefs.getInt("wsrestart",     0) != 0);
@@ -254,13 +257,13 @@ void connectToWebSocket() {
   if (WiFi.status() != WL_CONNECTED) return;
   webSocket.disconnect();
   delay(20);
-  webSocket.begin(wsHost, wsPort, "/");
+  webSocket.begin(wsHost.c_str(), wsPort, "/");
   webSocket.onEvent(onWebSocketEvent);
   webSocket.enableHeartbeat(15000, 3000, 2);
   lastPingMs = millis();
   lastAppPingMs = 0;
   lastWSConnectAttemptMs = millis();
-  Serial.printf("WS begin: %s:%u\n", wsHost, wsPort);
+  Serial.printf("WS begin: %s:%u\n", wsHost.c_str(), wsPort);
 }
 
 // ================= TESTE AO VIVO (wizard) =================
@@ -900,7 +903,7 @@ select option{background:var(--cd)}
       <div class="sec">Identificação</div>
       <label>Node ID</label>
       <input id="nodeid" placeholder="ex: C00045">
-      <div class="hint">O servidor é fixo de fábrica. O teste confirma o prédio/máquina deste Node ID.</div>
+      <div class="hint">O servidor vem configurado de fábrica (alterável só no Administrador). O teste confirma o prédio/máquina deste Node ID.</div>
       <button class="btn tbtn" id="t2">Testar WebSocket</button>
       <div class="ts" id="ts2">Testa a conexão com o servidor.</div>
     </div>
@@ -1085,6 +1088,12 @@ select option{background:var(--cd)}
     <button class="btn" id="bNode">Salvar Node ID</button>
   </div>
   <div class="box">
+    <div class="sec">Servidor (WebSocket)</div>
+    <label>Host</label><input id="host">
+    <label>Porta</label><input id="port" type="number" min="1" max="65535">
+    <button class="btn" id="bSrv">Salvar servidor</button>
+  </div>
+  <div class="box">
     <div class="sec">Rede 1</div>
     <label>Redes</label><select id="ssid"></select>
     <label>Ou SSID manual</label><input id="m1">
@@ -1129,7 +1138,8 @@ function save(o){post(Object.keys(o).map(k=>k+'='+encodeURIComponent(o[k])).join
 function scan(){fetch('/scan').then(r=>r.json()).then(l=>{['ssid','ssid2'].forEach(id=>{let s=qs(id);s.innerHTML='<option value="">— escolher —</option>';l.forEach(i=>{let o=document.createElement('option');o.value=i.ssid;o.textContent=i.ssid+' · '+i.rssi+'dBm';s.appendChild(o);});});}).catch(()=>{});}
 window.onload=()=>{
   fetch('/config-data').then(r=>r.json()).then(d=>{
-    qs('nodeid').value=d.nodeid||''; setRelayMode(d.relayMode||0);
+    qs('nodeid').value=d.nodeid||''; qs('host').value=d.host||''; qs('port').value=d.port||80;
+    setRelayMode(d.relayMode||0);
     qs('invert').checked=(d.relayInvert===1); qs('wsrestart').checked=(d.wsrestart===1);
   }).catch(()=>{});
   scan();
@@ -1137,6 +1147,7 @@ window.onload=()=>{
   qs('modeOn').onclick=()=>setRelayMode(1);
   qs('modeOff').onclick=()=>setRelayMode(2);
   qs('bNode').onclick=()=>{if(!val('nodeid')){msg('Preencha o Node ID');return;}save({nodeid:val('nodeid')});};
+  qs('bSrv').onclick=()=>{if(!val('host')){msg('Preencha o host');return;}save({host:val('host'),port:val('port')||80});};
   qs('bN1').onclick=()=>{let s=val('m1')||val('ssid');if(!s){msg('Escolha a rede 1');return;}save({ssid:s,pass:qs('p1').value});};
   qs('bN2').onclick=()=>{save({ssid2:(val('m2')||val('ssid2')),pass2:qs('p2').value});};
   qs('bRelay').onclick=()=>{save({relayMode:relayModeVal,relayInvert:(qs('invert').checked?1:0)});};
@@ -1167,7 +1178,7 @@ void handleTestWifiStatus() {
 }
 
 void handleTestWs() {
-  String   host = server.hasArg("host") ? server.arg("host") : String(wsHost);
+  String   host = server.hasArg("host") ? server.arg("host") : wsHost;
   uint16_t port = server.hasArg("port") ? (uint16_t)server.arg("port").toInt() : wsPort;
   String   nid  = server.hasArg("nodeid") ? server.arg("nodeid") : nodeId;
   String building, machine; bool found = false;
@@ -1189,6 +1200,8 @@ void handleConfigData() {
   json += "\"ssid2\":"       + (sSsid2.length() ? "\""+sSsid2+"\"" : "\"\"") + ",";
   json += "\"pass2\":"       + (sPass2.length() ? "\""+sPass2+"\"" : "\"\"") + ",";
   json += "\"nodeid\":\""    + nodeId + "\",";
+  json += "\"host\":\""      + wsHost + "\",";
+  json += "\"port\":"        + String(wsPort) + ",";
   json += "\"relayMode\":"   + String(relayMode) + ",";
   json += "\"relayInvert\":" + String(relayInvert ? 1 : 0) + ",";
   json += "\"wsrestart\":"   + String(wsRestartEnabled ? 1 : 0);
@@ -1205,6 +1218,8 @@ void handleSave() {
   if (server.hasArg("ssid2"))      { sSsid2 = server.arg("ssid2"); prefs.putString("ssid2", sSsid2); any = true; }
   if (server.hasArg("pass2"))      { sPass2 = server.arg("pass2"); prefs.putString("pass2", sPass2); any = true; }
   if (server.hasArg("nodeid"))     { nodeId = server.arg("nodeid"); prefs.putString("nodeid", nodeId); any = true; }
+  if (server.hasArg("host"))       { wsHost = server.arg("host");  prefs.putString("wsHost", wsHost); any = true; }
+  if (server.hasArg("port"))       { wsPort = (uint16_t)constrain(server.arg("port").toInt(), 1, 65535); prefs.putInt("wsPort", wsPort); any = true; }
   if (server.hasArg("relayMode"))  { relayMode = constrain(server.arg("relayMode").toInt(), 0, 2); prefs.putInt("relayMode", relayMode); any = true; relayChanged = true; }
   if (server.hasArg("relayInvert")){ relayInvert = server.arg("relayInvert").toInt() == 1; prefs.putInt("relayInvert", relayInvert ? 1 : 0); any = true; relayChanged = true; }
   if (server.hasArg("wsrestart"))  { wsRestartEnabled = server.arg("wsrestart").toInt() == 1; prefs.putInt("wsrestart", wsRestartEnabled ? 1 : 0); any = true; }
@@ -1227,6 +1242,8 @@ void handleStatusJson() {
   json += "\"ip_sta\":\""      + (staOk ? WiFi.localIP().toString() : String("")) + "\",";
   json += "\"ip_ap\":\""       + WiFi.softAPIP().toString() + "\",";
   json += "\"wsConnected\":"   + String(isWebSocketConnected ? "true" : "false") + ",";
+  json += "\"host\":\""        + wsHost + "\",";
+  json += "\"port\":"          + String(wsPort) + ",";
   json += "\"temp\":"          + String(readInternalTempC(), 1) + ",";
   json += "\"relayOn\":"       + String(isRelayEffectiveOn() ? "true" : "false") + ",";
   json += "\"relayMode\":"     + String(relayMode) + ",";
@@ -1599,7 +1616,7 @@ void handleWSStatusPage() {
     "<header><div class='logo'>FOREASY</div><div class='sub'>status websocket</div></header>"
     "<main>"
     "<div class='it'><span class='lbl'>Conectado</span><span class='vl'>" + String(isWebSocketConnected ? "SIM" : "NÃO") + "</span></div>"
-    "<div class='it'><span class='lbl'>Servidor</span><span class='vl'>" + String(wsHost) + "</span></div>"
+    "<div class='it'><span class='lbl'>Servidor</span><span class='vl'>" + wsHost + ":" + String(wsPort) + "</span></div>"
     "<div class='it'><span class='lbl'>Backoff atual</span><span class='vl'>" + String(wsNextRetryMs) + " ms</span></div>"
     "<div class='it'><span class='lbl'>Auto-restart</span><span class='vl'>" + String(wsRestartEnabled ? "SIM" : "NÃO") + "</span></div>"
     "<div class='nav'><a href='/'>← menu</a></div>"

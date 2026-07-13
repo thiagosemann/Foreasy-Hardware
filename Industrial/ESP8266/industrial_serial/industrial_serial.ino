@@ -40,9 +40,10 @@
 // AP: ativo 10 min após boot — SSID: <nodeId>-AP | Senha: 12345678
 //     Após expirar: AP desliga, logs do buffer são apagados (lean mode).
 //
-// EEPROM v4 (magic 0xF0EA5E01):
+// EEPROM v5 (magic 0xF0EA5E01):
 //   ssid[32], pass[64], ssid2[32], pass2[64], nodeId[24],
-//   machineMode, relayInvert, bootCount, lastResetReason, wsRestartEnabled.
+//   machineMode, relayInvert, bootCount, lastResetReason, wsRestartEnabled,
+//   wsHost[64], wsPort (servidor alterável apenas pelo /admin).
 //   Apaga setor antes de salvar + até 3 tentativas de commit com verificação.
 //   bootCount incrementado em RAM; não salvo automaticamente a cada boot.
 //
@@ -70,6 +71,7 @@ static const bool ERASE_SECTOR_BEFORE_SAVE = true;
 static const uint8_t COMMIT_TRIES = 3;
 
 // ======================== WS =========================
+// Defaults de fábrica; o host/porta efetivos ficam em P.wsHost/P.wsPort (alteráveis só no /admin)
 static const char*    WS_HOST = "frst-back-02b607761078.herokuapp.com";
 static const uint16_t WS_PORT = 80;
 
@@ -171,7 +173,7 @@ static char logBuffer[LOG_MAX_LEN + 1];
 // ======================== EEPROM =========================
 #define EEPROM_SIZE 512
 static const uint32_t EEPROM_MAGIC = 0xF0EA5E01;
-static const uint16_t EEPROM_VER   = 4; // v4: wsRestartEnabled (auto-restart sem WS)
+static const uint16_t EEPROM_VER   = 5; // v5: wsHost/wsPort configuráveis (v4: wsRestartEnabled)
 
 struct __attribute__((packed)) Persist {
   uint32_t magic;
@@ -191,6 +193,10 @@ struct __attribute__((packed)) Persist {
 
   uint8_t  wsRestartEnabled; // 0=off, 1=reinicia após 1h sem WS
   uint8_t  reserved[5];
+
+  // v5 (campos no fim para preservar o layout v3/v4 na migração)
+  char     wsHost[64];       // servidor WS (alterável só no /admin)
+  uint16_t wsPort;
 };
 
 Persist P;
@@ -401,12 +407,19 @@ static void persistDefaults() {
   // defaults novos
   P.machineMode = 1;  // industrial (fixo)
   P.relayInvert = 0;
+
+  strncpy(P.wsHost, WS_HOST, sizeof(P.wsHost) - 1);
+  P.wsPort = WS_PORT;
 }
 
 static void applyPersistRuntime() {
   relayInvert = (P.relayInvert != 0);
   updateRelayLevels();
   relayOffSafe();
+
+  // fail-safe: host vazio ou porta 0 na EEPROM → volta ao default de fábrica
+  if (P.wsHost[0] == '\0') strncpy(P.wsHost, WS_HOST, sizeof(P.wsHost) - 1);
+  if (P.wsPort == 0)       P.wsPort = WS_PORT;
 }
 
 static void persistLoad() {
@@ -414,11 +427,14 @@ static void persistLoad() {
 
   if (DEBUG_EEPROM_DUMP) debugEepromDump(0, 64);
 
-  if (P.magic == EEPROM_MAGIC && P.ver == 3) {
-    // Migração v3 -> v4: preserva config, adiciona wsRestartEnabled=0
-    P.ver = EEPROM_VER;
-    P.wsRestartEnabled = 0;
+  if (P.magic == EEPROM_MAGIC && (P.ver == 3 || P.ver == 4)) {
+    // Migração v3/v4 -> v5: preserva config, adiciona novos campos com defaults
+    if (P.ver == 3) P.wsRestartEnabled = 0;
     memset(P.reserved, 0, sizeof(P.reserved));
+    memset(P.wsHost, 0, sizeof(P.wsHost));
+    strncpy(P.wsHost, WS_HOST, sizeof(P.wsHost) - 1);
+    P.wsPort = WS_PORT;
+    P.ver = EEPROM_VER;
     EEPROM.put(0, P);
     EEPROM.commit();
   } else if (P.magic != EEPROM_MAGIC || P.ver != EEPROM_VER) {
@@ -658,12 +674,12 @@ static void connectToWebSocket() {
     return;
   }
 
-  if (apEnabled) logf("Iniciando WebSocket: %s:%u path:/", WS_HOST, WS_PORT);
+  if (apEnabled) logf("Iniciando WebSocket: %s:%u path:/", P.wsHost, (unsigned)P.wsPort);
 
   webSocket.disconnect();
   delay(20);
 
-  webSocket.begin(WS_HOST, WS_PORT, "/");
+  webSocket.begin(P.wsHost, P.wsPort, "/");
   webSocket.onEvent(onWebSocketEvent);
   webSocket.enableHeartbeat(15000, 3000, 2);
 
@@ -739,10 +755,10 @@ static bool testWsSync(const String& nodeId, String& building, String& machine, 
 
   WiFiClient c;
   c.setTimeout(5000);
-  if (!c.connect(WS_HOST, WS_PORT)) return false;
+  if (!c.connect(P.wsHost, P.wsPort)) return false;
 
   c.printf("GET / HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-           "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", WS_HOST);
+           "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", P.wsHost);
   String resp; uint32_t t0 = millis();
   while (c.connected() && (millis() - t0) < 5000 && resp.length() < 512) {
     while (c.available()) resp += (char)c.read();
@@ -848,7 +864,7 @@ input:focus,select:focus{border-color:var(--ac)}select option{background:var(--c
     <div class="step" id="step2">
       <div class="sec">Identificação</div>
       <label>Node ID</label><input id="nodeid" placeholder="ex: I00047">
-      <div class="hint">O servidor é fixo de fábrica. O teste confirma o prédio/máquina deste Node ID.</div>
+      <div class="hint">O servidor vem configurado de fábrica (alterável só no Administrador). O teste confirma o prédio/máquina deste Node ID.</div>
       <button class="btn tbtn" id="t2">Testar WebSocket</button>
       <div class="ts" id="ts2">Testa a conexão com o servidor.</div>
     </div>
@@ -926,6 +942,7 @@ input,select{width:100%;background:var(--ip);color:var(--tx);border:1px solid va
 <header><div class="logo">FOREASY</div><div class="sub">administrador · esp8266</div></header>
 <main>
   <div class="box"><div class="sec">Node ID</div><input id="nodeid"><button class="btn" id="bNode">Salvar Node ID</button></div>
+  <div class="box"><div class="sec">Servidor (WebSocket)</div><label>Host</label><input id="host"><label>Porta</label><input id="port" type="number" min="1" max="65535"><button class="btn" id="bSrv">Salvar servidor</button></div>
   <div class="box"><div class="sec">Rede 1</div><label>Redes</label><select id="ssid"></select><label>Ou SSID manual</label><input id="m1"><label>Senha</label><input id="p1" type="text"><button class="btn" id="bN1">Salvar rede 1</button></div>
   <div class="box"><div class="sec">Rede 2 (failover)</div><label>SSID manual</label><input id="m2"><label>Senha</label><input id="p2" type="text"><button class="btn" id="bN2">Salvar rede 2</button></div>
   <div class="box"><div class="sec">Opções do relé</div><div class="chk"><input id="invert" type="checkbox"><label for="invert">Inverter lógica (NF)</label></div><div class="chk"><input id="wsrestart" type="checkbox"><label for="wsrestart">Auto-restart se 1h sem WS</label></div><button class="btn" id="bOpt">Salvar opções</button></div>
@@ -941,9 +958,10 @@ function post(b){msg('Salvando…');fetch('/save',{method:'POST',headers:{'Conte
 function save(o){post(Object.keys(o).map(function(k){return k+'='+encodeURIComponent(o[k]);}).join('&'));}
 function scan(){fetch('/scan').then(function(r){return r.json();}).then(function(l){var s=qs('ssid');s.innerHTML='<option value="">— escolher —</option>';l.forEach(function(i){var o=document.createElement('option');o.value=i.ssid;o.textContent=i.ssid+' · '+i.rssi+'dBm';s.appendChild(o);});}).catch(function(){});}
 window.onload=function(){
-  fetch('/config-data').then(function(r){return r.json();}).then(function(d){qs('nodeid').value=d.nodeid||'';qs('invert').checked=(d.invert===1);qs('wsrestart').checked=(d.wsrestart===1);}).catch(function(){});
+  fetch('/config-data').then(function(r){return r.json();}).then(function(d){qs('nodeid').value=d.nodeid||'';qs('host').value=d.host||'';qs('port').value=d.port||80;qs('invert').checked=(d.invert===1);qs('wsrestart').checked=(d.wsrestart===1);}).catch(function(){});
   scan();
   qs('bNode').onclick=function(){if(!val('nodeid')){msg('Preencha o Node ID');return;}save({nodeid:val('nodeid')});};
+  qs('bSrv').onclick=function(){if(!val('host')){msg('Preencha o host');return;}save({host:val('host'),port:val('port')||80});};
   qs('bN1').onclick=function(){var s=val('m1')||val('ssid');if(!s){msg('Escolha a rede 1');return;}save({ssid:s,pass:qs('p1').value});};
   qs('bN2').onclick=function(){save({ssid2:val('m2'),pass2:qs('p2').value});};
   qs('bOpt').onclick=function(){save({invert:(qs('invert').checked?1:0),wsrestart:(qs('wsrestart').checked?1:0)});};
@@ -955,18 +973,19 @@ window.onload=function(){
 
 // ======================== HTTP handlers =========================
 static void handleConfigData() {
-  char ssEsc[70], pwEsc[134], ss2Esc[70], pw2Esc[134], nidEsc[52];
-  json_escape_into(P.ssid,   ssEsc,  sizeof(ssEsc));
-  json_escape_into(P.pass,   pwEsc,  sizeof(pwEsc));
-  json_escape_into(P.ssid2,  ss2Esc, sizeof(ss2Esc));
-  json_escape_into(P.pass2,  pw2Esc, sizeof(pw2Esc));
-  json_escape_into(P.nodeId, nidEsc, sizeof(nidEsc));
+  char ssEsc[70], pwEsc[134], ss2Esc[70], pw2Esc[134], nidEsc[52], hostEsc[134];
+  json_escape_into(P.ssid,   ssEsc,   sizeof(ssEsc));
+  json_escape_into(P.pass,   pwEsc,   sizeof(pwEsc));
+  json_escape_into(P.ssid2,  ss2Esc,  sizeof(ss2Esc));
+  json_escape_into(P.pass2,  pw2Esc,  sizeof(pw2Esc));
+  json_escape_into(P.nodeId, nidEsc,  sizeof(nidEsc));
+  json_escape_into(P.wsHost, hostEsc, sizeof(hostEsc));
 
-  char buf[540];
+  char buf[700];
   snprintf(buf, sizeof(buf),
     "{\"ssid\":\"%s\",\"pass\":\"%s\",\"ssid2\":\"%s\",\"pass2\":\"%s\","
-    "\"nodeid\":\"%s\",\"mode\":1,\"invert\":%u,\"wsrestart\":%u}",
-    ssEsc, pwEsc, ss2Esc, pw2Esc, nidEsc,
+    "\"nodeid\":\"%s\",\"host\":\"%s\",\"port\":%u,\"mode\":1,\"invert\":%u,\"wsrestart\":%u}",
+    ssEsc, pwEsc, ss2Esc, pw2Esc, nidEsc, hostEsc, (unsigned)P.wsPort,
     (unsigned)P.relayInvert, (unsigned)P.wsRestartEnabled
   );
   server.send(200, "application/json", buf);
@@ -1236,6 +1255,8 @@ static void handleSave() {
   if (server.hasArg("ssid2"))     { memset(P.ssid2, 0, sizeof(P.ssid2));  server.arg("ssid2").toCharArray(P.ssid2, sizeof(P.ssid2));  any = true; }
   if (server.hasArg("pass2"))     { memset(P.pass2, 0, sizeof(P.pass2));  server.arg("pass2").toCharArray(P.pass2, sizeof(P.pass2));  any = true; }
   if (server.hasArg("nodeid"))    { memset(P.nodeId,0, sizeof(P.nodeId)); server.arg("nodeid").toCharArray(P.nodeId,sizeof(P.nodeId)); any = true; }
+  if (server.hasArg("host"))      { memset(P.wsHost,0, sizeof(P.wsHost)); server.arg("host").toCharArray(P.wsHost, sizeof(P.wsHost));  any = true; }
+  if (server.hasArg("port"))      { long pt = server.arg("port").toInt(); P.wsPort = (uint16_t)((pt < 1 || pt > 65535) ? WS_PORT : pt); any = true; }
   if (server.hasArg("invert"))    { P.relayInvert      = server.arg("invert").toInt()    ? 1 : 0; any = true; }
   if (server.hasArg("wsrestart")) { P.wsRestartEnabled = server.arg("wsrestart").toInt() ? 1 : 0; any = true; }
 
