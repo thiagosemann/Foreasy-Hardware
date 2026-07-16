@@ -979,8 +979,6 @@ function testWs(){
 }
 
 function next(){
-  if(cur===0 && !net1ok){msg('Teste a rede 1 antes de avançar.');return;}
-  if(cur===2 && !wsdone){msg('Teste o servidor antes de avançar.');return;}
   msg('');
   if(cur===N-1) return save();
   cur++; paint();

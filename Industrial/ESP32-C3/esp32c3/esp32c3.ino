@@ -56,10 +56,10 @@
 // SCAN WIFI: assíncrono (não bloqueia o loop)
 // TEMPERATURA: sensor interno do ESP32-C3 via temperatureRead()
 //
-// PINOS (configuráveis via /config; strapping ESP32-C3: GPIO2, GPIO8, GPIO9):
+// PINOS (configuráveis só no /admin; strapping ESP32-C3: GPIO2, GPIO8, GPIO9):
 // - ledPin   : GPIO8  (fixo — LED azul integrado, ATIVO LOW)
-// - startPin : GPIO5  (START IN, ativo HIGH)
-// - availPin : GPIO6  (AVAIL OUT, INPUT_PULLUP)
+// - startPin : GPIO4  (START IN, ativo HIGH)
+// - availPin : GPIO2  (AVAIL OUT, INPUT_PULLUP)
 //
 // ATENÇÃO LED: GPIO8 tem o LED azul integrado do Super Mini (ativo LOW).
 //   Conectado = LOW (LED aceso) | Desconectado = HIGH (LED apagado).
@@ -88,8 +88,8 @@ Preferences prefs;
 
 // ---------- IO (pinos configuráveis via /config, persistidos na NVS) ----------
 int ledPin   = 8;   // LED azul integrado do Super Mini — ATIVO LOW (fixo)
-int startPin = 5;   // pulso START IN (Speed Queen H3-7), ativo HIGH
-int availPin = 6;   // leitura AVAIL OUT (Speed Queen H3-4), INPUT_PULLUP
+int startPin = 4;   // pulso START IN (Speed Queen H3-7), ativo HIGH
+int availPin = 2;   // leitura AVAIL OUT (Speed Queen H3-4), INPUT_PULLUP
 
 // ---------- Pulso START IN ----------
 const uint16_t PULSE_MS = 100;
@@ -1014,7 +1014,7 @@ select option{background:var(--cd)}
     <div class="pill cur" id="pill0"><b>1</b><span>Rede 1</span></div>
     <div class="pill" id="pill1"><b>2</b><span>Rede 2</span></div>
     <div class="pill" id="pill2"><b>3</b><span>Servidor</span></div>
-    <div class="pill" id="pill3"><b>4</b><span>Pinos</span></div>
+    <div class="pill" id="pill3"><b>4</b><span>Opções</span></div>
   </div>
   <div class="track"><div class="fill" id="bar"></div></div>
 
@@ -1053,13 +1053,10 @@ select option{background:var(--cd)}
     </div>
 
     <div class="step" id="step3">
-      <div class="sec">Pinos — Industrial</div>
-      <label>GPIO START IN (pulso, ativo HIGH)</label>
-      <input id="startPin" type="number" min="0" max="21">
-      <label>GPIO AVAIL OUT (leitura status)</label>
-      <input id="availPin" type="number" min="0" max="21">
-      <div class="chk"><input id="availEn" type="checkbox"><label for="availEn">Usar AVAIL como fail-safe (confirma o ciclo e repulsa se a máquina não ligar)</label></div>
-      <div class="hint">Evite strapping pins do C3: GPIO2, 8, 9. AVAIL usa pull-up interno (sem resistor externo). <b>Modelos sem AVAIL: deixe o fail-safe desmarcado.</b></div>
+      <div class="sec">Opções — Industrial</div>
+      <div class="chk"><input id="availEn" type="checkbox"><label for="availEn">Fail-safe AVAIL — confirma o ciclo e repulsa se a máquina não ligar</label></div>
+      <div class="chk"><input id="wsrestart" type="checkbox"><label for="wsrestart">Reiniciar automaticamente após 1h sem WebSocket</label></div>
+      <div class="hint"><b>Modelos sem AVAIL: deixe o fail-safe desmarcado.</b> Os pinos (START IN / AVAIL OUT) usam os padrões e só são ajustados no Administrador.</div>
     </div>
   </div>
 
@@ -1120,8 +1117,6 @@ function testWs(){
 }
 
 function next(){
-  if(cur===0 && !net1ok){msg('Teste a rede 1 antes de avançar.');return;}
-  if(cur===2 && !wsdone){msg('Teste o servidor antes de avançar.');return;}
   msg('');
   if(cur===N-1) return save();
   cur++; paint();
@@ -1138,9 +1133,8 @@ function save(){
     '&ssid2='+encodeURIComponent(ss2)+
     '&pass2='+encodeURIComponent(qs('pass2').value)+
     '&nodeid='+encodeURIComponent(qs('nodeid').value.trim())+
-    '&startPin='+(qs('startPin').value||5)+
-    '&availPin='+(qs('availPin').value||6)+
-    '&availEn='+(qs('availEn').checked?1:0);
+    '&availEn='+(qs('availEn').checked?1:0)+
+    '&wsrestart='+(qs('wsrestart').checked?1:0);
   fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b})
     .then(r=>r.text()).then(t=>{msg(t+' Reconecte ao Wi-Fi em ~5s.');})
     .catch(()=>msg('Falha ao salvar.'));
@@ -1165,9 +1159,8 @@ window.onload=()=>{
     qs('manual_ssid').value=d.ssid||''; qs('pass').value=d.pass||'';
     qs('ssid2').value=d.ssid2||''; qs('pass2').value=d.pass2||'';
     qs('nodeid').value=d.nodeid||'';
-    qs('startPin').value=d.startPin!=null?d.startPin:5;
-    qs('availPin').value=d.availPin!=null?d.availPin:6;
     qs('availEn').checked=(d.availEn===1);
+    qs('wsrestart').checked=(d.wsrestart===1);
   }).catch(()=>{});
   scan();
   qs('t0').onclick=()=>{net1ok=false;testWifi(qs('manual_ssid').value.trim()||qs('ssid').value,qs('pass').value,'ts0',(ok)=>{net1ok=ok;});};
@@ -1270,7 +1263,7 @@ function scan(){fetch('/scan').then(r=>r.json()).then(l=>{['ssid','ssid2'].forEa
 window.onload=()=>{
   fetch('/config-data').then(r=>r.json()).then(d=>{
     qs('nodeid').value=d.nodeid||''; qs('host').value=d.host||''; qs('port').value=d.port||80;
-    qs('startPin').value=d.startPin!=null?d.startPin:5; qs('availPin').value=d.availPin!=null?d.availPin:6;
+    qs('startPin').value=d.startPin!=null?d.startPin:4; qs('availPin').value=d.availPin!=null?d.availPin:2;
     qs('availEn').checked=(d.availEn===1); qs('wsrestart').checked=(d.wsrestart===1);
   }).catch(()=>{});
   scan();
@@ -1278,7 +1271,7 @@ window.onload=()=>{
   qs('bSrv').onclick=()=>{if(!val('host')){msg('Preencha o host');return;}save({host:val('host'),port:val('port')||80});};
   qs('bN1').onclick=()=>{let s=val('m1')||val('ssid');if(!s){msg('Escolha a rede 1');return;}save({ssid:s,pass:qs('p1').value});};
   qs('bN2').onclick=()=>{save({ssid2:(val('m2')||val('ssid2')),pass2:qs('p2').value});};
-  qs('bPin').onclick=()=>{save({startPin:val('startPin')||5,availPin:val('availPin')||6,availEn:(qs('availEn').checked?1:0)});};
+  qs('bPin').onclick=()=>{save({startPin:val('startPin')||4,availPin:val('availPin')||2,availEn:(qs('availEn').checked?1:0)});};
   qs('bAdv').onclick=()=>{save({wsrestart:(qs('wsrestart').checked?1:0)});};
   qs('bRst').onclick=()=>{if(confirm('Reiniciar o dispositivo?')){msg('Reiniciando…');fetch('/restart');}};
   qs('bClr').onclick=()=>{if(confirm('Apagar TODA a configuração e reiniciar?')){msg('Apagando…');fetch('/resetwifi');}};

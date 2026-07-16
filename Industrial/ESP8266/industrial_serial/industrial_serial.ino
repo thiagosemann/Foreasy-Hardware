@@ -903,7 +903,7 @@ function testWs(){var nid=qs('nodeid').value.trim();if(!nid){setTs('ts2','err','
     else if(j.ok)setTs('ts2','err','⚠ Servidor OK, mas o Node ID "'+nid+'" não foi encontrado. Confira o Node ID.');
     else setTs('ts2','err','✗ Não conectou ao servidor. Você pode avançar e revisar depois.');
   }).catch(function(){wsdone=true;setTs('ts2','err','✗ Falha no teste. Você pode avançar mesmo assim.');});}
-function next(){if(cur===0&&!net1ok){msg('Teste a rede 1 antes de avançar.');return;}if(cur===2&&!wsdone){msg('Teste o servidor antes de avançar.');return;}msg('');if(cur===N-1)return save();cur++;paint();}
+function next(){msg('');if(cur===N-1)return save();cur++;paint();}
 function back(){if(cur>0){cur--;paint();msg('');}}
 function save(){var ss=qs('manual_ssid').value.trim()||qs('ssid').value;var ss2=qs('ssid2').value.trim();
   if(!qs('nodeid').value.trim()){msg('Preencha o Node ID');return;}msg('Salvando…');
