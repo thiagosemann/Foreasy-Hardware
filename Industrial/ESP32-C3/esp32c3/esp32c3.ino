@@ -44,7 +44,7 @@
 // - Watchdog global   : sem WiFi+WS >8min → failover
 // - Detecção de zumbi : sem ping/pong por >5min → reconecta
 // - App ping a cada 30s | heartbeat: 15s/3s/2 tentativas
-// - wsRestartEnabled  : reinicia ESP32-C3 após 1h sem WS (opcional, configurável)
+// - wsRestartEnabled  : reinicia ESP32-C3 após 30min sem WS (opcional, configurável)
 //
 // AP: ativo 10 min após boot (lean mode após expirar)
 //     SSID: <nodeId>-AP | Senha: 12345678
@@ -167,7 +167,7 @@ const uint32_t GLOBAL_DOWN_RESET_MS = 8UL * 60UL * 1000UL;
 
 // ---------- WS auto-restart ----------
 uint32_t wsLastOkMs = 0;
-const uint32_t WS_RESTART_TIMEOUT_MS = 60UL * 60UL * 1000UL;
+const uint32_t WS_RESTART_TIMEOUT_MS = 30UL * 60UL * 1000UL; // 30 minutos
 bool wsRestartEnabled = false;
 
 // ---------- Boot count ----------
@@ -897,7 +897,7 @@ void wsRestartTick() {
   if (isWebSocketConnected) { wsLastOkMs = millis(); return; }
   if (pulseActive)           { wsLastOkMs = millis(); return; }
   if ((millis() - wsLastOkMs) > WS_RESTART_TIMEOUT_MS) {
-    Serial.println("WS_RESTART: sem WS por 1h. Reiniciando.");
+    Serial.println("WS_RESTART: sem WS por 30min. Reiniciando.");
     delay(200);
     ESP.restart();
   }
@@ -1055,7 +1055,7 @@ select option{background:var(--cd)}
     <div class="step" id="step3">
       <div class="sec">Opções — Industrial</div>
       <div class="chk"><input id="availEn" type="checkbox"><label for="availEn">Fail-safe AVAIL — confirma o ciclo e repulsa se a máquina não ligar</label></div>
-      <div class="chk"><input id="wsrestart" type="checkbox"><label for="wsrestart">Reiniciar automaticamente após 1h sem WebSocket</label></div>
+      <div class="chk"><input id="wsrestart" type="checkbox"><label for="wsrestart">Reiniciar automaticamente após 30min sem WebSocket</label></div>
       <div class="hint"><b>Modelos sem AVAIL: deixe o fail-safe desmarcado.</b> Os pinos (START IN / AVAIL OUT) usam os padrões e só são ajustados no Administrador.</div>
     </div>
   </div>
@@ -1246,7 +1246,7 @@ select option{background:var(--cd)}
   </div>
   <div class="box">
     <div class="sec">Avançado</div>
-    <div class="chk"><input id="wsrestart" type="checkbox"><label for="wsrestart">Auto-restart se 1h sem WebSocket</label></div>
+    <div class="chk"><input id="wsrestart" type="checkbox"><label for="wsrestart">Auto-restart se 30min sem WebSocket</label></div>
     <button class="btn" id="bAdv">Salvar avançado</button>
     <div class="row"><button class="btn ghost" id="bRst">Reiniciar</button><button class="btn danger" id="bClr">Apagar tudo</button></div>
   </div>

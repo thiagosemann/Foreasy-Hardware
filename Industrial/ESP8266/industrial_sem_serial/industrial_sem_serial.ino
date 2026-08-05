@@ -34,7 +34,7 @@
 //   Backoff exponencial 10s → 120s.
 //   Watchdog WS  : sem WS >5min  → failover WiFi+WS.
 //   Watchdog geral: sem WiFi+WS >8min → failover.
-//   wsRestartEnabled: reinicia o ESP após 1h sem WS (configurável via /config).
+//   wsRestartEnabled: reinicia o ESP após 30min sem WS (configurável via /config).
 //
 // AP: ativo 10 min após boot — SSID: <nodeId>-AP | Senha: 12345678
 //     Após expirar: AP desliga (lean mode). Logs críticos continuam via Serial.
@@ -135,7 +135,7 @@ static bool lastLedState = false;
 
 // WS auto-restart
 static uint32_t wsLastOkMs = 0;
-static const uint32_t WS_RESTART_TIMEOUT_MS = 60UL * 60UL * 1000UL; // 1 hora
+static const uint32_t WS_RESTART_TIMEOUT_MS = 30UL * 60UL * 1000UL; // 30 minutos
 
 // Restart remoto (WS 0x06) — adiado p/ a resposta "Restarting" sair antes do reboot
 static bool     pendingRestart   = false;
@@ -188,7 +188,7 @@ struct __attribute__((packed)) Persist {
   uint32_t bootCount;     // incrementa em RAM no boot (não commit automático)
   uint8_t  lastResetReason;
 
-  uint8_t  wsRestartEnabled; // 0=off, 1=reinicia após 1h sem WS
+  uint8_t  wsRestartEnabled; // 0=off, 1=reinicia após 30min sem WS
   uint8_t  reserved[5];
 
   // v5 (campos no fim para preservar o layout v3/v4 na migração)
@@ -887,7 +887,7 @@ input:focus,select:focus{border-color:var(--ac)}select option{background:var(--c
     <div class="step" id="step3">
       <div class="sec">Opções do relé</div>
       <div class="chk"><input id="invert" type="checkbox"><label for="invert">Inverter lógica do relé (NF, Normalmente Fechado)</label></div>
-      <div class="chk"><input id="wsrestart" type="checkbox"><label for="wsrestart">Auto-restart se ficar 1h sem WebSocket</label></div>
+      <div class="chk"><input id="wsrestart" type="checkbox"><label for="wsrestart">Auto-restart se ficar 30min sem WebSocket</label></div>
     </div>
   </div>
   <div class="nav"><button class="btn ghost" id="back">Voltar</button><button class="btn ghost" id="skip" style="display:none">Pular</button><button class="btn" id="next">Avançar</button></div>
@@ -961,7 +961,7 @@ input,select{width:100%;background:var(--ip);color:var(--tx);border:1px solid va
   <div class="box"><div class="sec">Servidor (WebSocket)</div><label>Host</label><input id="host"><label>Porta</label><input id="port" type="number" min="1" max="65535"><button class="btn" id="bSrv">Salvar servidor</button></div>
   <div class="box"><div class="sec">Rede 1</div><label>Redes</label><select id="ssid"></select><label>Ou SSID manual</label><input id="m1"><label>Senha</label><input id="p1" type="text"><button class="btn" id="bN1">Salvar rede 1</button></div>
   <div class="box"><div class="sec">Rede 2 (failover)</div><label>SSID manual</label><input id="m2"><label>Senha</label><input id="p2" type="text"><button class="btn" id="bN2">Salvar rede 2</button></div>
-  <div class="box"><div class="sec">Opções do relé</div><div class="chk"><input id="invert" type="checkbox"><label for="invert">Inverter lógica (NF)</label></div><div class="chk"><input id="wsrestart" type="checkbox"><label for="wsrestart">Auto-restart se 1h sem WS</label></div><button class="btn" id="bOpt">Salvar opções</button></div>
+  <div class="box"><div class="sec">Opções do relé</div><div class="chk"><input id="invert" type="checkbox"><label for="invert">Inverter lógica (NF)</label></div><div class="chk"><input id="wsrestart" type="checkbox"><label for="wsrestart">Auto-restart se 30min sem WS</label></div><button class="btn" id="bOpt">Salvar opções</button></div>
   <div class="box"><div class="sec">Sistema</div><div class="row"><button class="btn ghost" id="bRst">Reiniciar</button><button class="btn danger" id="bClr">Apagar tudo</button></div></div>
   <div class="msg" id="msg"></div>
   <div class="foot"><a href="/">← início</a><a href="/wizard">assistente</a><a href="/info">/info</a></div>
@@ -1438,7 +1438,7 @@ static void wsRestartTick() {
   if (!P.wsRestartEnabled) return;
   if (isWebSocketConnected) { wsLastOkMs = millis(); return; }
   if ((millis() - wsLastOkMs) > WS_RESTART_TIMEOUT_MS) {
-    logf("WS_RESTART: sem WS por 1h. Reiniciando.");
+    logf("WS_RESTART: sem WS por 30min. Reiniciando.");
     delay(200);
     ESP.restart();
   }

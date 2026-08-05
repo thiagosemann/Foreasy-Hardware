@@ -21,7 +21,7 @@ firmware gravado.
 
 | Sistema | O que faz | Hardware |
 |---------|-----------|----------|
-| **Convencional** | Controle direto de energia: o relé liga/desliga a alimentação da máquina. Funciona com qualquer lavadora. | ESP32 + relé 30A |
+| **Convencional** | Controle direto de energia: o relé liga/desliga a alimentação da máquina. Funciona com qualquer lavadora. | ESP32 + relé 30A; ESP8266 + relé 10A acionando módulo 30A |
 | **Industrial** | Integração com **Speed Queen** via conector H3: um **pulso** de 100ms no START IN libera o ciclo; o **AVAIL OUT** informa se a máquina está livre/ocupada. | ESP32-C3 / ESP32-S3 (cabo direto) e ESP8266 (pulso via relé) |
 
 > **Industrial = pulso momentâneo** (dispara o crédito e o pino volta ao repouso).
@@ -43,6 +43,7 @@ firmware gravado.
 | MCU | Acionamento | Observações |
 |-----|-------------|-------------|
 | **ESP32** (Modelos 3 e 4) | Relé 30A ON/OFF (`relayPin` GPIO2) | Modelo 4: relé aciona SSR externo |
+| **ESP8266** ESP-01S (Modelo 6) | Relé 10A do shield no **GPIO0** aciona um **módulo de relé 30A** externo | Serial 115200 livre para debug; sem OTA e sem `temp` |
 
 ### Arquivos
 - `Industrial/ESP32-S3/esp32s3/esp32s3.ino`
@@ -50,6 +51,7 @@ firmware gravado.
 - `Industrial/ESP8266/industrial_serial/industrial_serial.ino`
 - `Industrial/ESP8266/industrial_sem_serial/industrial_sem_serial.ino`
 - `Convencional/ESP32/esp32/esp32.ino`
+- `Convencional/ESP8266/esp8266/esp8266.ino`
 - `Convencional/ESP32-S3-MIDEA/midea_iot/midea_iot.ino` (variante Midea — fora do escopo dos 5 acima)
 
 ---
@@ -62,7 +64,7 @@ firmware gravado.
 - **WebSocket**: backoff exponencial 10s→120s; watchdog WS down >5min → failover;
   watchdog global sem WiFi+WS >8min → failover; detecção de zumbi (sem ping/pong
   >5min → reconecta); app ping 30s; `enableHeartbeat(15000, 3000, 2)`;
-  `wsRestartEnabled` (reinicia após 1h sem WS, opcional).
+  `wsRestartEnabled` (reinicia após 30min sem WS, opcional).
 - **Identidade no connect**: envia `ID:<nodeId>` se ligado, `NID:<nodeId>` se desligado.
 - **AP de configuração**: ativo 10 min após boot (SSID `<nodeId>-AP`, senha
   `12345678`); depois lean mode (AP desliga).
@@ -122,6 +124,23 @@ firmware gravado.
   `/relay`, `/relay/on|off|config`, `/nodeid`, `/savenodeid`, `/wifistatus`, `/wsstatus`.
 - Modelo 4: o relé aciona um SSR externo.
 
+### ESP8266 — `esp8266.ino` (Convencional, Modelo 6)
+- Mesma lógica do convencional do ESP32 (`relayMode` 0/1/2, `relayInvert`, `ID:`/`NID:`
+  no connect, páginas `/wizard`, `/admin`, `/relay`, `/info`, `/nodeid`,
+  `/wifistatus`, `/wsstatus`), portada para ESP-01S.
+- O relé de **10A do shield (GPIO0)** aciona um **módulo de relé 30A** externo — a
+  carga nunca passa pelo shield.
+- **Sem OTA `0x04`** (1MB de flash) e **sem `temp`** no `0x03` (não há sensor interno).
+- **EEPROM própria**: `magic=0xF0EA5E0C`, v1 — o mesmo layout do industrial + `relayMode`.
+  Magic diferente de propósito: gravar este firmware sobre uma placa industrial cai
+  nos defaults e exige reconfiguração pelo AP.
+- **GPIO0 é strapping pin**: o setup força LOW (relé desligado, lógica NA) e os
+  watchdogs só fazem failover — nunca reiniciam sozinhos. `relayInvert` só com o
+  módulo de 30A no contato NC. O auto-restart de 30min sem WS é ignorado com o relé ligado.
+- `/relay/config` grava direto na EEPROM **sem reiniciar** (não derruba máquina em uso);
+  `/save` continua reiniciando. Páginas em PROGMEM (`send_P`), logs em `/logs` (JSON/texto)
+  enquanto o AP estiver ativo; scan Wi-Fi assíncrono com o tipo de criptografia já em texto.
+
 ---
 
 ## 5. Protocolo WebSocket
@@ -129,14 +148,14 @@ firmware gravado.
 Mensagens binárias (1 byte de comando); resposta sempre em texto. `0x04` só onde há
 flash para imagem dupla; `0x05` só onde há sensor AVAIL.
 
-| Byte | Industrial C3/S3 | Industrial ESP8266 | Convencional ESP32 |
-|------|------------------|--------------------|--------------------|
-| `0x01` | Pulso START IN (100ms) ¹ | Pulso relé (100ms) | Relé ON (se `relayMode`=0) |
-| `0x02` | ignorado | ignorado | Relé OFF (se `relayMode`=0) |
-| `0x03` | Telemetria JSON ² | Telemetria JSON ² (sem `temp`) | Telemetria JSON ² |
-| `0x04` | OTA | — (sem flash) | OTA |
-| `0x05` | Status AVAIL ³ | — | — |
-| `0x06` | Restart remoto | Restart remoto | Restart remoto |
+| Byte | Industrial C3/S3 | Industrial ESP8266 | Convencional ESP32 | Convencional ESP8266 |
+|------|------------------|--------------------|--------------------|----------------------|
+| `0x01` | Pulso START IN (100ms) ¹ | Pulso relé (100ms) | Relé ON (se `relayMode`=0) | Relé ON (se `relayMode`=0) |
+| `0x02` | ignorado | ignorado | Relé OFF (se `relayMode`=0) | Relé OFF (se `relayMode`=0) |
+| `0x03` | Telemetria JSON ² | Telemetria JSON ² (sem `temp`) | Telemetria JSON ² | Telemetria JSON ² (sem `temp`) |
+| `0x04` | OTA | — (sem flash) | OTA | — (sem flash) |
+| `0x05` | Status AVAIL ³ | — | — | — |
+| `0x06` | Restart remoto | Restart remoto | Restart remoto | Restart remoto |
 
 ¹ Sem `availEn`: responde `RelayStatus:ON` imediatamente. Com `availEn`: resposta
 assíncrona via `creditTick` (`RelayStatus:ON` / `CreditBusy` / `CreditFail`).
