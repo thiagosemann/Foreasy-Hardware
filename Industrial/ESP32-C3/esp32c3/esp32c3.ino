@@ -245,6 +245,11 @@ bool hasSavedWiFi()      { return strlen(activeSSID()) > 0; }
 // o AP já casado com a rede; se ainda assim falhar, derrubamos o AP.
 int      wifiChannelHint = 0;    // canal da última conexão OK (0 = desconhecido)
 uint8_t  wifiFailStreak  = 0;    // tentativas de associação falhadas em sequência
+uint32_t wifiDownSinceMs = 0;    // desde quando o status está desconectado (0 = está OK)
+// Janela de confirmação antes de recomeçar a conexão. Curta o bastante para não
+// atrasar uma queda real (o timeout de tentativa é 40s), longa o bastante para
+// absorver o piscar do status.
+const uint32_t WIFI_DOWN_CONFIRM_MS = 5000;
 const uint8_t WIFI_FAIL_HARD_RESET = 2;   // após N falhas, desliga o rádio (disconnect(true))
 const uint8_t WIFI_FAIL_DROP_AP    = 3;   // após N falhas, derruba o AP e tenta em STA puro
 const uint32_t AP_INSTALL_GRACE_MS = 3UL * 60UL * 1000UL;  // AP intocável neste período
@@ -1008,7 +1013,16 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       // para fechar, inclusive no "Header response timeout" (TCP abre, o 101 não
       // vem). Vários seguidos sem nenhum WStype_CONNECTED no meio = pilha de rede
       // travada, e aí só o reset resolve — sem esperar o watchdog.
-      if (wsHandshakeFailStreak < 250) wsHandshakeFailStreak++;
+      //
+      // MAS só conta com o WiFi associado. Sem rede o WebSocket falha por motivo
+      // óbvio, e contar isso disparava um reset de WiFi justamente enquanto ele
+      // tentava subir — que produzia mais falhas de WebSocket, que disparavam
+      // outro reset. Em bancada esse laço se repetiu dez vezes e nunca convergia.
+      if (WiFi.status() != WL_CONNECTED) {
+        wsHandshakeFailStreak = 0;
+      } else if (wsHandshakeFailStreak < 250) {
+        wsHandshakeFailStreak++;
+      }
       Serial.printf("WS desconectado (%u seguidas). Retentativa a cargo da lib.\n",
                     wsHandshakeFailStreak);
       if (wsHandshakeFailStreak >= WS_HANDSHAKE_FAIL_RESET) {
@@ -1249,7 +1263,25 @@ void wifiTick() {
     }
   }
 
-  if (WiFi.status() != WL_CONNECTED && !wifiConnecting && hasSavedWiFi()) {
+  // O WiFi.status() oscila: em bancada ele reportou desconectado por um instante
+  // com a associação e o WebSocket saudáveis, e o begin() disparado por esse
+  // piscar derrubava os dois de uma vez — no log, "WiFi begin" e "WS desconectado"
+  // no MESMO milissegundo, sem nenhum timeout antes. Só agimos depois que o status
+  // se mantiver desconectado por WIFI_DOWN_CONFIRM_MS.
+  bool staUp = (WiFi.status() == WL_CONNECTED);
+  if (staUp) {
+    if (wifiDownSinceMs != 0) {
+      uint32_t d = millis() - wifiDownSinceMs;
+      if (d > 200) Serial.printf("WiFi: oscilacao de %lums absorvida (nao reconectou)\n",
+                                 (unsigned long)d);
+      wifiDownSinceMs = 0;
+    }
+  } else if (wifiDownSinceMs == 0) {
+    wifiDownSinceMs = millis();
+  }
+
+  if (!staUp && !wifiConnecting && hasSavedWiFi()
+      && (millis() - wifiDownSinceMs) >= WIFI_DOWN_CONFIRM_MS) {
     if ((millis() - lastWiFiAttemptMs) >= WIFI_RETRY_INTERVAL_MS) {
       lastWiFiAttemptMs = millis();
       connectToWiFi_begin();
