@@ -33,25 +33,37 @@
 //   O backend cruza com is_in_use antes de marcar a ficha (não toca is_in_use).
 //
 // WIFI:
+// - Potência de TX configurável por peça no wizard e no /admin (NVS "txpower").
+//   Peça sem nada salvo opera em 15 dBm — fail-safe para que o AP suba mesmo nas
+//   placas do lote fraco, que a 19,5 dBm não emitem beacon. As telas vêm com
+//   19,5 pré-selecionado, então a configuração normal sobe a peça para potência
+//   cheia; só as reprovadas em bancada ficam em 15. Reafirmada a cada 5s
+//   (txPowerTick), porque toda troca de modo devolve o rádio ao máximo —
+//   inclusive o softAPdisconnect() do fim do AP. Confira pelo campo "txp" em
+//   /status, que é leitura de volta do rádio.
 // - Dual WiFi com failover automático entre rede 1 e rede 2 (sem restart)
 // - Conexão não-bloqueante: wifiTick() com timeout 40s e retry a cada 5s
 // - Credenciais NUNCA apagadas por falha de conexão
 //
 // WEBSOCKET:
 // - Servidor (host/porta) configurável apenas via /admin e salvo na NVS
-// - Backoff exponencial: 10s base → 120s máximo
-// - Watchdog WS down  : sem WS por >5min  → failover WiFi+WS
-// - Watchdog global   : sem WiFi+WS >8min → failover
+// - Reconexão feita pela lib, com backoff 1s→30s empurrado via
+//   setReconnectInterval() (sem isso ela martela a cada 500ms, o default dela)
+// - Escada de recuperação, tudo automático e sem depender de configuração:
+//     >5min sem WS (WiFi de pé) → reinicia só o WebSocket
+//     >10min                    → failover de WiFi (troca de rede)
+//     >8min sem WiFi nem WS     → failover de WiFi
+//     >15min sem WS             → REINICIA a peça (+ jitter de até 3min por peça,
+//                                 para a frota não reiniciar toda no mesmo instante)
 // - Detecção de zumbi : sem ping/pong por >5min → reconecta
 // - App ping a cada 30s | heartbeat: 15s/3s/2 tentativas
-// - wsRestartEnabled  : reinicia ESP32-C3 após 30min sem WS (opcional, configurável)
 //
 // AP: ativo 10 min após boot (lean mode após expirar)
 //     SSID: <nodeId>-AP | Senha: 12345678
 //
 // ARMAZENAMENTO: Preferences (NVS) — ssid, pass, ssid2, pass2, nodeid,
-//                wsHost, wsPort, startPin, availPin, availEn, wsrestart, bootCount
-// bootCount incrementado em RAM; salvo apenas no /save (evita desgaste da flash)
+//                wsHost, wsPort, startPin, availPin, availEn, txpower, bootCount
+// bootCount é gravado a cada boot (é o que permite detectar reinícios na frota)
 //
 // SCAN WIFI: assíncrono (não bloqueia o loop)
 // TEMPERATURA: sensor interno do ESP32-C3 via temperatureRead()
@@ -75,8 +87,85 @@
 #include <Update.h>
 #include <mbedtls/sha256.h>
 
-#define FW_VERSION "1.0.0"   // reportado no 0x03 para auditoria da frota
+#define FW_VERSION "1.1.0"   // reportado no 0x03 para auditoria da frota
 #define FW_CHIP    "esp32c3" // identifica o chip na telemetria / seleção de OTA
+
+// ---------- Potência de transmissão do rádio ----------
+// Configurável POR PEÇA no /admin e persistida na NVS (chave "txpower", em
+// quartos de dBm — a unidade do próprio enum wifi_power_t).
+// PADRÃO: 19,5 dBm, o máximo do core, que é o comportamento de fábrica.
+//
+// Por que é configurável: o lote de placas do segundo fornecedor não sustenta os
+// picos de corrente do TX em potência cheia — o 3V3 afunda, a transmissão sai
+// corrompida e a peça não associa em rede nenhuma nem emite beacon do AP, embora
+// a recepção fique perfeita. A 15 dBm essas peças conectam normalmente
+// (docs/LAUDO-LOTE-ESP32C3.md).
+//
+// A escolha NÃO é automática, de propósito. A falha dessas placas é intermitente
+// e depende de temperatura e carga: um teste no boot passaria numa unidade
+// marginal, ela ficaria travada em 19,5 dBm e cairia horas depois. Quem
+// identifica a peça ruim é o teste de bancada do laudo; aqui só se aplica a
+// decisão já tomada.
+//
+// Há DOIS padrões diferentes, de propósito:
+//
+//  - Peça sem nada salvo na NVS nasce em 15 dBm (TXPOWER_BOOT_Q). É fail-safe:
+//    placa do lote ruim a 19,5 dBm não emite nem o beacon do próprio AP, então
+//    nascer em potência cheia deixaria a peça impossível de configurar. Em 15
+//    dBm o AP aparece em qualquer placa e sempre dá para rodar o wizard.
+//
+//  - A opção pré-selecionada no wizard e no /admin é 19,5 dBm. Ou seja: quem
+//    passa pela configuração normal sai em potência cheia, e só as unidades
+//    reprovadas no teste de bancada são deliberadamente baixadas para 15.
+//
+// Enum, em quartos de dBm: 19,5=78 · 17=68 · 15=60 · 13=52 · 11=44 · 8,5=34 · 5=20
+const int TXPOWER_MIN_Q  =  8;   // 2 dBm — piso de sanidade
+const int TXPOWER_MAX_Q  = 78;   // 19,5 dBm
+const int TXPOWER_BOOT_Q = 60;   // 15 dBm — usado enquanto a NVS não tem valor
+wifi_power_t txPower = (wifi_power_t)TXPOWER_BOOT_Q;
+
+// ---------- Reafirmação da potência ----------
+// Com txPower no máximo (o padrão) isto é inócuo: nada fica ACIMA de 19,5. Passa
+// a valer nas peças configuradas abaixo do máximo — e aí é indispensável, porque
+// aplicar uma vez no boot não basta:
+//
+// 1. Qualquer troca de modo devolve o rádio à potência máxima. A pegadinha é o
+//    softAPdisconnect(true) do apLifetimeTick: por dentro ele faz
+//    AP.end() -> enableAP(false) -> mode(WIFI_STA) — ou seja, uma troca de modo.
+//    Sem reaplicar, a peça volta a 19,5 dBm no minuto 10 de todo boot.
+//
+// 2. setTxPower() é ignorado EM SILÊNCIO se nenhuma interface tiver reportado
+//    START: o guard testa STA.started()/AP.started(), que leem o bit
+//    ESP_NETIF_STARTED_BIT, setado por evento de forma assíncrona. Chamado logo
+//    depois de WiFi.mode(), pode simplesmente não valer.
+//
+// A comparação é ">" e não "!=" de propósito — o rádio pode aplicar um degrau um
+// pouco abaixo do pedido, e isso é aceitável; o que não pode é voltar para cima.
+const uint32_t TXPOWER_CHECK_MS = 5000;
+uint32_t lastTxPowerCheckMs = 0;
+
+bool radioStarted() { return WiFi.STA.started() || WiFi.AP.started(); }
+
+// getTxPower() devolve 19,5 dBm como fallback quando nada está iniciado, então a
+// checagem de radioStarted() vem antes — sem ela, leríamos um valor inventado.
+bool applyTxPower() {
+  if (!radioStarted()) return false;
+  if (WiFi.getTxPower() <= txPower) return true;
+  WiFi.setTxPower(txPower);
+  return WiFi.getTxPower() <= txPower;
+}
+
+void txPowerTick() {
+  if ((millis() - lastTxPowerCheckMs) < TXPOWER_CHECK_MS) return;
+  lastTxPowerCheckMs = millis();
+  if (!radioStarted()) return;
+  wifi_power_t cur = WiFi.getTxPower();
+  if (cur > txPower) {
+    Serial.printf("TXPOWER: %.1f dBm fora do alvo, reaplicando %.1f dBm\n",
+                  cur / 4.0, txPower / 4.0);
+    WiFi.setTxPower(txPower);
+  }
+}
 
 float readInternalTempC() {
   return temperatureRead();
@@ -145,11 +234,38 @@ uint16_t wsPort = 80;
 bool isWebSocketConnected = false;
 
 // ---------- WS backoff ----------
-uint32_t lastWSConnectAttemptMs = 0;
-uint8_t  wsRetryStreak          = 0;
-const uint32_t WS_RETRY_BASE_MS = 10000;
-const uint32_t WS_RETRY_MAX_MS  = 120000;
-uint32_t wsNextRetryMs = WS_RETRY_BASE_MS;
+// Quem reconecta é a PRÓPRIA LIB: WebSocketsClient::loop() tenta de novo sozinha
+// a cada _reconnectInterval enquanto estiver desconectada. O default dela é
+// 500 ms — duas tentativas por segundo, por peça, para sempre. Com a frota fora
+// do ar isso vira uma enxurrada de handshakes em cima do servidor, que atrasa a
+// volta de todo mundo. O backoff abaixo passa a DIRIGIR esse intervalo
+// (setReconnectInterval), em vez de correr por fora sem efeito nenhum.
+//
+// O backoff é derivado do TEMPO fora do ar, não de contagem de tentativas: a lib
+// não avisa por callback quando uma tentativa de conexão falha
+// (connectFailedCb() só escreve no log, não dispara WStype_DISCONNECTED), então
+// contar por evento deixaria o intervalo travado no valor inicial para sempre.
+//
+// Rápido no começo — a esmagadora maioria das quedas é um blip e volta na
+// primeira ou segunda tentativa — e com teto de 30s, para que nenhuma peça fique
+// mais que isso sem tentar, mesmo depois de horas fora.
+uint32_t wsRetryIntervalMs = 0;   // último valor empurrado para a lib
+bool     wsBegun = false;         // begin() já rodou ao menos uma vez?
+
+uint32_t wsBackoffFor(uint32_t downMs) {
+  if (downMs <  10000UL) return  1000UL;
+  if (downMs <  30000UL) return  2000UL;
+  if (downMs <  60000UL) return  5000UL;
+  if (downMs < 300000UL) return 10000UL;
+  return 30000UL;
+}
+
+void applyWsBackoff(uint32_t downMs) {
+  uint32_t want = wsBackoffFor(downMs);
+  if (want == wsRetryIntervalMs) return;   // evita chamada a cada volta do loop
+  wsRetryIntervalMs = want;
+  webSocket.setReconnectInterval(want);
+}
 
 // ---------- Ping/pong ----------
 uint32_t lastPingMs = 0;
@@ -160,18 +276,160 @@ uint32_t lastAppPingMs = 0;
 const uint32_t APP_PING_INTERVAL_MS = 30UL * 1000UL;
 
 // ---------- Watchdogs ----------
+uint8_t  wsDownEscalation = 0;   // 0 = próxima ação é reiniciar só o WS; 1 = failover de WiFi
 uint32_t wsDownSinceMs = 0;
 const uint32_t WS_DOWN_RESET_MS = 5UL * 60UL * 1000UL;
 uint32_t lastConnectivityOkMs = 0;
 const uint32_t GLOBAL_DOWN_RESET_MS = 8UL * 60UL * 1000UL;
 
 // ---------- WS auto-restart ----------
+// Último recurso, e INCONDICIONAL de propósito: é a única coisa que tira a peça
+// de um estado travado sem alguém ir até lá. Antes era um checkbox que vinha
+// desmarcado por padrão — ou seja, na prática a maioria da frota não tinha
+// reinício automático nenhum e ficava fora até puxarem da tomada.
+// Reiniciar aqui é inócuo: o START IN é um pulso, então a máquina em
+// funcionamento não para, e o tick nunca reinicia no meio de um pulso.
 uint32_t wsLastOkMs = 0;
-const uint32_t WS_RESTART_TIMEOUT_MS = 30UL * 60UL * 1000UL; // 30 minutos
-bool wsRestartEnabled = false;
+const uint32_t WS_RESTART_TIMEOUT_MS = 15UL * 60UL * 1000UL; // 15 minutos
+// Jitter por peça, derivado do MAC. Sem ele, uma queda longa do servidor faz a
+// frota inteira reiniciar no mesmo segundo e voltar toda junta. Dimensionado em
+// 3min para a janela real ficar entre 15 e 18min — espalhamento suficiente para
+// 40 peças sem esticar demais o tempo de recuperação.
+uint32_t wsRestartJitterMs = 0;
+const uint32_t WS_RESTART_JITTER_MAX_MS = 3UL * 60UL * 1000UL;
 
 // ---------- Boot count ----------
 uint32_t bootCount = 0;
+
+// Motivo do último reset — distingue queda de energia, reinício por software,
+// brownout (alimentação da placa) e crash. Sem isso não dá para saber se a peça
+// voltou porque o auto-restart funcionou ou porque faltou luz.
+const char* resetReasonStr() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "POWERON";
+    case ESP_RST_SW:        return "SW";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_WDT:       return "WDT";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_EXT:       return "EXT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    default:                return "UNKNOWN";
+  }
+}
+
+// ================= CAIXA-PRETA DE DESCONEXÃO =================
+// Registra o que aconteceu enquanto a peça esteve sem servidor e entrega o
+// relato assim que reconecta. Existe porque hoje, quando uma peça some, não
+// sobra rastro nenhum: quem chega no local encontra a peça ligada e sem conexão,
+// e a única ação disponível — reiniciar — apaga qualquer evidência.
+//
+// Duas decisões importantes:
+//
+// 1. O log é PERSISTIDO NA NVS. Manter só em RAM perderia exatamente o caso que
+//    motivou o recurso: o técnico reinicia a peça na mão e leva o histórico
+//    junto. Persistido, o relato sobrevive a reinício manual, queda de energia e
+//    ao auto-restart, e é enviado no reconect seguinte.
+//
+// 2. O campo mais valioso é o `reason` do ARDUINO_EVENT_WIFI_STA_DISCONNECTED,
+//    o código com que o próprio AP/stack explica a queda. É ele que separa
+//    "roteador sumiu" (201 NO_AP_FOUND) de "perdeu os beacons por distância"
+//    (200 BEACON_TIMEOUT) de "o AP expulsou a peça" (8 ASSOC_LEAVE) de senha
+//    errada (15 HANDSHAKE_TIMEOUT). E a AUSÊNCIA de qualquer EV_WIFI_DOWN numa
+//    peça que ficou horas fora é diagnóstico por si só: significa que ela
+//    seguia associada e só não conseguia transmitir.
+enum EvCode : uint8_t {
+  EV_BOOT      = 1,   // arg = esp_reset_reason(). Também marca onde o relógio zerou.
+  EV_WIFI_UP   = 2,   // arg = RSSI
+  EV_WIFI_DOWN = 3,   // arg = reason code do ESP-IDF
+  EV_WS_UP     = 4,
+  EV_WS_DOWN   = 5,
+  EV_WD_WS     = 6,   // watchdog reiniciou só o WebSocket
+  EV_WD_FAIL   = 7,   // watchdog trocou de rede; arg = slot que passou a valer
+};
+
+struct Ev { uint32_t t; int16_t arg; uint8_t code; };
+const uint8_t EV_MAX = 20;
+
+// count/head moram DENTRO do blob persistido para que salvar seja uma única
+// escrita na NVS em vez de três — numa peça que oscila, a diferença é entre
+// dezenas e centenas de escritas por dia.
+struct EvLog { uint8_t count; uint8_t head; Ev ev[EV_MAX]; };
+EvLog evLog = { 0, 0, {} };
+
+bool     evDirty = false;
+uint32_t evLastSaveMs = 0;
+// Grava no máximo a cada 2min. Perder até 2min de eventos é irrelevante aqui, e
+// mantém o desgaste da flash em dezenas de escritas por dia mesmo em queda crônica.
+const uint32_t EV_SAVE_MIN_INTERVAL_MS = 2UL * 60UL * 1000UL;
+// evAdd também é chamado da task de eventos do WiFi, não só do loop: sem o
+// spinlock, uma preempção no meio da escrita corromperia o buffer.
+portMUX_TYPE evMux = portMUX_INITIALIZER_UNLOCKED;
+
+void evAdd(uint8_t code, int16_t arg) {
+  uint32_t t = millis() / 1000UL;
+  portENTER_CRITICAL(&evMux);
+  evLog.ev[evLog.head] = { t, arg, code };
+  evLog.head = (evLog.head + 1) % EV_MAX;
+  if (evLog.count < EV_MAX) evLog.count++;
+  evDirty = true;
+  portEXIT_CRITICAL(&evMux);
+}
+
+void evLoad() {
+  if (prefs.getBytesLength("evlog") != sizeof(evLog)) return;
+  prefs.getBytes("evlog", &evLog, sizeof(evLog));
+  // Blob inconsistente (versão antiga, gravação interrompida): descarta em vez
+  // de indexar fora do buffer.
+  if (evLog.count > EV_MAX || evLog.head >= EV_MAX) { evLog.count = 0; evLog.head = 0; }
+}
+
+void evSaveTick() {
+  if (!evDirty) return;
+  if ((millis() - evLastSaveMs) < EV_SAVE_MIN_INTERVAL_MS) return;
+  evDirty = false;
+  evLastSaveMs = millis();
+  prefs.putBytes("evlog", &evLog, sizeof(evLog));
+}
+
+// Não persiste na hora de propósito: deixa para o evSaveTick, respeitando o
+// limite de 2min. O pior caso é reenviar um relato já entregue se a peça
+// reiniciar nesse intervalo — duplicata é inofensiva, escrita em flash não é.
+void evClear() {
+  portENTER_CRITICAL(&evMux);
+  evLog.count = 0;
+  evLog.head  = 0;
+  evDirty = true;
+  portEXIT_CRITICAL(&evMux);
+}
+
+// Serializa em ordem cronológica. Formato compacto [t,codigo,arg] porque isto
+// viaja por WebSocket e fica guardado por peça — 20 eventos dão ~300 bytes.
+String evJson() {
+  String s;
+  s.reserve(420);
+  s += "{\"up\":" + String(millis() / 1000UL);
+  s += ",\"rst\":\"" + String(resetReasonStr()) + "\"";
+  s += ",\"fw\":\"" FW_VERSION "\",\"ev\":[";
+  uint8_t start = (evLog.head + EV_MAX - evLog.count) % EV_MAX;
+  for (uint8_t i = 0; i < evLog.count; i++) {
+    const Ev& e = evLog.ev[(start + i) % EV_MAX];
+    if (i) s += ",";
+    s += "[" + String(e.t) + "," + String(e.code) + "," + String(e.arg) + "]";
+  }
+  s += "]}";
+  return s;
+}
+
+// Handler de eventos do WiFi — é a única forma de obter o motivo da queda.
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+    evAdd(EV_WIFI_UP, (int16_t)WiFi.RSSI());
+  } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    evAdd(EV_WIFI_DOWN, (int16_t)info.wifi_sta_disconnected.reason);
+  }
+}
 
 // ---------- OTA (requisição enfileirada; executa em otaTick, fora do callback WS) ----------
 bool   otaRequested = false;
@@ -188,7 +446,12 @@ enum TestState : uint8_t { TST_IDLE, TST_RUN, TST_OK, TST_FAIL };
 TestState wifiTestState   = TST_IDLE;
 bool      wifiTestActive  = false;
 uint32_t  wifiTestStartMs = 0;
+uint32_t  wifiTestDoneMs  = 0;   // quando o teste terminou (0 = não terminou)
 const uint32_t WIFI_TEST_TIMEOUT_MS = 12000;
+// Janela em que a peça segue "em modo teste" depois do resultado, para o
+// instalador ler a resposta e seguir para o /test-ws. Depois disso ela volta
+// sozinha à operação normal, aconteça o que acontecer.
+const uint32_t WIFI_TEST_HOLD_MS = 3UL * 60UL * 1000UL;
 String    wifiTestSsid, wifiTestPass;
 String    lastGoodSsid, lastGoodPass;   // última rede testada com sucesso (p/ o teste de WS)
 
@@ -287,16 +550,6 @@ void creditTick() {
   }
 }
 
-// ================= WS BACKOFF =================
-uint32_t computeWsBackoffMs() {
-  uint32_t v = WS_RETRY_BASE_MS;
-  uint8_t  s = wsRetryStreak;
-  while (s > 0 && v < WS_RETRY_MAX_MS) { v <<= 1; s--; }
-  return (v > WS_RETRY_MAX_MS) ? WS_RETRY_MAX_MS : v;
-}
-void resetWsBackoff() { wsRetryStreak = 0; wsNextRetryMs = WS_RETRY_BASE_MS; }
-void bumpWsBackoff()  { if (wsRetryStreak < 10) wsRetryStreak++; wsNextRetryMs = computeWsBackoffMs(); }
-
 // ================= FAILOVER =================
 void fullReconnectWiFiWS() {
   webSocket.disconnect();
@@ -306,10 +559,8 @@ void fullReconnectWiFiWS() {
   delay(150);
   wifiConnecting = false;
   lastWiFiAttemptMs = 0;
-  lastWSConnectAttemptMs = 0;
   lastPingMs = 0;
   wsDownSinceMs = 0;
-  resetWsBackoff();
   if (hasSavedWiFi()) connectToWiFi_begin();
 }
 
@@ -323,10 +574,8 @@ void switchWiFiSlot() {
   delay(150);
   wifiConnecting = false;
   lastWiFiAttemptMs = 0;
-  lastWSConnectAttemptMs = 0;
   lastPingMs = 0;
   wsDownSinceMs = 0;
-  resetWsBackoff();
   if (hasSavedWiFi()) connectToWiFi_begin();
 }
 
@@ -347,23 +596,46 @@ void loadPrefs() {
   startPin         = prefs.getInt("startPin", startPin);
   availPin         = prefs.getInt("availPin", availPin);
   availEnabled     = (prefs.getInt("availEn", 0) != 0);
-  wsRestartEnabled = (prefs.getInt("wsrestart",   0) != 0);
+  // 0 = chave ausente (nenhum valor válido é 0). Peça nunca configurada fica no
+  // fail-safe de 15 dBm, garantindo que o AP suba em qualquer placa.
+  int txq          = prefs.getInt("txpower", 0);
+  txPower          = (wifi_power_t)(txq ? constrain(txq, TXPOWER_MIN_Q, TXPOWER_MAX_Q)
+                                        : TXPOWER_BOOT_Q);
   bootCount        = prefs.getUInt("bootCount",   0);
 }
 
 // ================= AP + STA =================
 void setupAPSTA() {
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setTxPower(txPower);
   String apName = nodeId + "-AP";
   WiFi.softAP(apName.c_str(), "12345678", 1, false);
   delay(200);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
-  Serial.printf("AP: %s | IP: %s\n", apName.c_str(), WiFi.softAPIP().toString().c_str());
+  // Segunda aplicação, agora com o AP no ar: a de cima roda logo após o mode() e
+  // pode ter caído no guard de "nenhuma interface iniciada". O tx= do log abaixo
+  // é a leitura real do rádio, então serve de conferência.
+  applyTxPower();
+  // O tx= é leitura real do rádio; -1 quando nenhuma interface subiu ainda (nesse
+  // caso getTxPower() devolveria 19,5 de fallback e o log mentiria).
+  Serial.printf("AP: %s | IP: %s | tx=%.1fdBm\n", apName.c_str(),
+                WiFi.softAPIP().toString().c_str(),
+                radioStarted() ? WiFi.getTxPower() / 4.0 : -1.0);
 }
 
 void connectToWiFi_begin() {
   if (!hasSavedWiFi()) { Serial.println("Sem credenciais WiFi."); return; }
   WiFi.mode(WIFI_AP_STA);
+  // Trocar de modo reseta a potência para o máximo, e este é o caminho crítico:
+  // um failover faz WiFi.disconnect(true), que derruba o rádio inteiro
+  // (mode(0) -> esp_wifi_stop). Ao voltar, as interfaces levam alguns
+  // milissegundos para reportar START, e sem esse bit o setTxPower é ignorado em
+  // silêncio — a associação sairia em 19,5 dBm, justamente o pico de corrente que
+  // este lote não sustenta. A espera é limitada e só ocorre em tentativa de
+  // conexão, no máximo a cada 5s.
+  uint32_t t0 = millis();
+  while (!radioStarted() && (millis() - t0) < 500) delay(10);
+  applyTxPower();
   WiFi.begin(activeSSID(), activePass());
   wifiConnecting = true;
   wifiConnectStartMs = millis();
@@ -377,9 +649,12 @@ void connectToWebSocket() {
   webSocket.begin(wsHost.c_str(), wsPort, "/");
   webSocket.onEvent(onWebSocketEvent);
   webSocket.enableHeartbeat(15000, 3000, 2);
+  // Não mexemos no intervalo aqui: quem manda nele é o wsTick, que o recalcula a
+  // partir do downtime real na próxima volta do loop. Forçar a base neste ponto
+  // seria sobrescrito imediatamente e só confundiria a leitura do código.
+  wsBegun = true;
   lastPingMs = millis();
   lastAppPingMs = 0;
-  lastWSConnectAttemptMs = millis();
   Serial.printf("WS begin: %s:%u\n", wsHost.c_str(), wsPort);
 }
 
@@ -390,6 +665,7 @@ void startWifiTest(const String& ssid, const String& pass, int ch) {
   wifiTestActive  = true;
   wifiTestState   = TST_RUN;
   wifiTestStartMs = millis();
+  wifiTestDoneMs  = 0;
   wifiTestSsid = ssid; wifiTestPass = pass;
   webSocket.disconnect();
   isWebSocketConnected = false;
@@ -401,19 +677,37 @@ void startWifiTest(const String& ssid, const String& pass, int ch) {
     WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
     delay(60);
   }
+  applyTxPower();   // recriar o softAP em outro canal também mexe no rádio
   WiFi.begin(ssid.c_str(), pass.c_str());
   Serial.printf("TEST WiFi: SSID=%s ch=%d\n", ssid.c_str(), ch);
 }
 
 void wifiTestTick() {
+  // Trava de segurança. wifiTestActive suspende wifiTick() E wsTick(), e antes
+  // ela só era limpa dentro do apLifetimeTick — que roda UMA vez na vida da peça,
+  // no minuto 10. Como o servidor HTTP também responde no IP da rede local, um
+  // /test-wifi disparado depois disso deixava a peça sem gestão de WiFi e sem
+  // WebSocket até alguém puxar da tomada. Agora a janela sempre expira sozinha.
+  if (wifiTestActive && wifiTestState != TST_RUN && wifiTestDoneMs != 0 &&
+      (millis() - wifiTestDoneMs) > WIFI_TEST_HOLD_MS) {
+    Serial.println("TEST WiFi: janela expirou, retomando operacao normal.");
+    wifiTestActive = false;
+    wifiTestState  = TST_IDLE;
+    wifiTestDoneMs = 0;
+    if (hasSavedWiFi()) connectToWiFi_begin();
+    return;
+  }
+
   if (wifiTestState != TST_RUN) return;
   if (WiFi.status() == WL_CONNECTED) {
-    wifiTestState = TST_OK;
+    wifiTestState  = TST_OK;
+    wifiTestDoneMs = millis();
     lastGoodSsid = wifiTestSsid;
     lastGoodPass = wifiTestPass;
     Serial.printf("TEST WiFi OK. IP=%s\n", WiFi.localIP().toString().c_str());
   } else if ((millis() - wifiTestStartMs) > WIFI_TEST_TIMEOUT_MS) {
-    wifiTestState = TST_FAIL;
+    wifiTestState  = TST_FAIL;
+    wifiTestDoneMs = millis();
     WiFi.disconnect(false);
     Serial.println("TEST WiFi FAIL.");
   }
@@ -627,9 +921,16 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       lastPingMs  = millis();
       wsLastOkMs  = millis();
       wsDownSinceMs = 0;
-      resetWsBackoff();
+      evAdd(EV_WS_UP, 0);
       String msg = pulseActive ? ("ID:" + nodeId) : ("NID:" + nodeId);
       webSocket.sendTXT(msg);
+      // Entrega a caixa-preta logo depois do ID — o servidor precisa saber de
+      // quem é o relato antes de recebê-lo. Limpa após enviar para não repetir
+      // o mesmo histórico em cada reconexão.
+      if (evLog.count > 0) {
+        webSocket.sendTXT("Offline:" + evJson());
+        evClear();
+      }
       // Snapshot do AVAIL na reconexão (§11.4b): resolve ficha iniciada/encerrada com o WS
       // caído. O backend cruza com is_in_use, então em uso nosso legítimo vira no-op.
       if (availEnabled && creditState == CR_IDLE) {
@@ -641,8 +942,8 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 
     case WStype_DISCONNECTED:
       isWebSocketConnected = false;
-      bumpWsBackoff();
-      Serial.printf("WS desconectado. Backoff=%ums (streak=%u)\n", wsNextRetryMs, wsRetryStreak);
+      evAdd(EV_WS_DOWN, 0);
+      Serial.println("WS desconectado. Retentativa a cargo da lib (backoff em wsTick).");
       break;
 
     case WStype_PING:
@@ -660,10 +961,11 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 
         if (b == 0x03) {
           bool staOk = (WiFi.status() == WL_CONNECTED);
-          char buf[340];
+          char buf[420];
           snprintf(buf, sizeof(buf),
             "{\"rssi\":%d,\"ch\":%d,\"heap\":%u,\"block\":%u,\"cpu\":%u,"
             "\"uptime\":%lu,\"boots\":%lu,\"wifiSlot\":%u,\"temp\":%.1f,"
+            "\"txp\":%.1f,\"rst\":\"%s\","
             "\"machineMode\":1,\"pulse\":%s,\"chip\":\"%s\",\"fw\":\"%s\"}",
             staOk ? WiFi.RSSI() : 0,
             staOk ? (int)WiFi.channel() : 0,
@@ -674,6 +976,8 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             (unsigned long)bootCount,
             (unsigned)wifiSlot,
             readInternalTempC(),
+            radioStarted() ? WiFi.getTxPower() / 4.0 : -1.0,
+            resetReasonStr(),
             pulseActive ? "true" : "false",
             FW_CHIP,
             FW_VERSION
@@ -745,6 +1049,30 @@ void setup() {
   loadPrefs();
 
   bootCount++;
+  // Gravado a cada boot, não só no /save. Antes o contador voltava sempre ao
+  // valor da última configuração, então a telemetria reportava o mesmo número
+  // para sempre e não dava para ver reinício nenhum. O desgaste é irrelevante:
+  // a NVS faz wear leveling e são poucas dezenas de gravações por dia no pior caso.
+  prefs.putUInt("bootCount", bootCount);
+  Serial.printf("Boot #%lu | motivo do ultimo reset: %s\n",
+                (unsigned long)bootCount, resetReasonStr());
+
+  // Jitter do auto-restart, derivado do MAC de fábrica. Deliberadamente NÃO é
+  // esp_random(): aqui no setup o rádio ainda não subiu, e sem Wi-Fi/BT ativo o
+  // gerador não é verdadeiramente aleatório — havia risco real de a frota
+  // inteira sortear o mesmo valor, que é exatamente o que o jitter existe para
+  // evitar. O MAC é único por placa e estável entre reinícios, que é o que
+  // queremos: espalhamento determinístico, não aleatoriedade.
+  // Caixa-preta: carrega o que sobrou do boot anterior ANTES de registrar o
+  // EV_BOOT, para que o relato preserve o que aconteceu antes do reinício —
+  // que é justamente o trecho que interessa quando alguém reinicia na mão.
+  evLoad();
+  evAdd(EV_BOOT, (int16_t)esp_reset_reason());
+
+  wsRestartJitterMs = (uint32_t)(ESP.getEfuseMac() % WS_RESTART_JITTER_MAX_MS);
+  Serial.printf("Auto-restart sem WS em %lumin (base 15 + jitter %lumin)\n",
+                (unsigned long)((WS_RESTART_TIMEOUT_MS + wsRestartJitterMs) / 60000UL),
+                (unsigned long)(wsRestartJitterMs / 60000UL));
 
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, HIGH);  // HIGH = LED apagado (ativo LOW no Super Mini)
@@ -761,10 +1089,11 @@ void setup() {
   apEnabled             = true;
   lastConnectivityOkMs  = millis();
   wsLastOkMs            = millis();
-  resetWsBackoff();
+  applyWsBackoff(0);
 
   WiFi.setAutoReconnect(false);
   WiFi.persistent(false);
+  WiFi.onEvent(onWiFiEvent);   // captura o motivo das quedas de WiFi
 
   setupAPSTA();
   startWebServer();
@@ -789,6 +1118,8 @@ void loop() {
   creditTick();
   watchdogTick();
   apLifetimeTick();
+  txPowerTick();
+  evSaveTick();
   wsRestartTick();
   otaTick();
   restartTick();
@@ -832,19 +1163,25 @@ void wsTick() {
     }
     if ((millis() - lastPingMs) > PING_TIMEOUT_MS) {
       Serial.println("WS zumbi (sem ping/pong). Reconectando.");
+      // Rebobina o relógio do downtime até a última prova de vida. A linha lá em
+      // cima acabou de empurrar wsLastOkMs para agora, mas na prática a conexão
+      // estava morta desde lastPingMs — sem isso, um zumbi de 5min "zeraria" o
+      // downtime e adiaria o auto-restart em outros 15min.
+      wsLastOkMs = lastPingMs;
       webSocket.disconnect();
       isWebSocketConnected = false;
-      bumpWsBackoff();
-      lastWSConnectAttemptMs = 0;
     }
+  } else {
+    // Fora do ar: espaça as tentativas conforme o tempo de queda. wsLastOkMs é
+    // atualizado acima enquanto conectado, então a diferença é o downtime real.
+    applyWsBackoff(millis() - wsLastOkMs);
   }
 
-  if (WiFi.status() == WL_CONNECTED && !isWebSocketConnected) {
-    if ((millis() - lastWSConnectAttemptMs) >= wsNextRetryMs) {
-      lastWSConnectAttemptMs = millis();
-      connectToWebSocket();
-    }
-  }
+  // A partir daqui quem retenta é a lib, no ritmo do backoff. Este bloco só
+  // garante que o begin() rodou uma vez com WiFi de pé — antes existia aqui uma
+  // segunda camada de retentativa que disputava com a da lib e, de 10 em 10s,
+  // abortava um handshake que já estava em andamento.
+  if (WiFi.status() == WL_CONNECTED && !wsBegun) connectToWebSocket();
 }
 
 void watchdogTick() {
@@ -855,14 +1192,32 @@ void watchdogTick() {
     bool wifiOk = (WiFi.status() == WL_CONNECTED);
     bool wsOk   = isWebSocketConnected;
 
+    // Escalonamento. Antes, "WS fora com WiFi de pé" já caía direto no failover
+    // de Wi-Fi — o que é a pior reação possível para esse diagnóstico: o Wi-Fi
+    // está funcionando por definição, então o problema é do outro lado
+    // (servidor, internet do prédio, DNS), e trocar de rede só faz a peça
+    // abandonar uma rede boa e depender do watchdog global de 8 min para voltar.
+    // Agora a primeira ação reinicia só o WebSocket; o failover de Wi-Fi fica
+    // para a segunda janela, quando reiniciar o WS já se mostrou insuficiente.
     if (wifiOk && !wsOk) {
       if (wsDownSinceMs == 0) wsDownSinceMs = millis();
       if ((millis() - wsDownSinceMs) > WS_DOWN_RESET_MS) {
-        Serial.println("WATCHDOG: WS down >5min. Failover.");
-        failoverReconnect();
+        wsDownSinceMs = millis();
+        if (wsDownEscalation == 0) {
+          Serial.println("WATCHDOG: WS down >5min. Reiniciando so o WebSocket.");
+          wsDownEscalation = 1;
+          evAdd(EV_WD_WS, 0);
+          connectToWebSocket();
+        } else {
+          Serial.println("WATCHDOG: WS down >10min. Failover de WiFi.");
+          wsDownEscalation = 0;
+          evAdd(EV_WD_FAIL, (int16_t)wifiSlot);
+          failoverReconnect();
+        }
       }
     } else {
       wsDownSinceMs = 0;
+      if (wsOk) wsDownEscalation = 0;
     }
 
     if (!wifiOk && !wsOk) {
@@ -881,11 +1236,18 @@ void apLifetimeTick() {
   if (apEnabled && (millis() - bootTimeMs >= AP_LIFETIME_MS)) {
     Serial.println("AP lifetime expirou. Desligando AP.");
     WiFi.softAPdisconnect(true);
+    // ESTE é o ponto que faltava. softAPdisconnect(true) é uma troca de modo
+    // (AP_STA -> STA) e derruba a potência de volta para 19,5 dBm. Era a única
+    // troca de modo do firmware que não reaplicava o limite: a peça saía do
+    // minuto 10 transmitindo em potência cheia, que é justamente o que este
+    // lote de placas não sustenta (docs/LAUDO-LOTE-ESP32C3.md).
+    applyTxPower();
     apEnabled = false;
     lastConnectivityOkMs = millis();
     if (wifiTestActive) {
       wifiTestActive = false;
       wifiTestState  = TST_IDLE;
+      wifiTestDoneMs = 0;
       WiFi.disconnect(false);
       if (hasSavedWiFi()) connectToWiFi_begin();
     }
@@ -893,11 +1255,18 @@ void apLifetimeTick() {
 }
 
 void wsRestartTick() {
-  if (!wsRestartEnabled) return;
   if (isWebSocketConnected) { wsLastOkMs = millis(); return; }
-  if (pulseActive)           { wsLastOkMs = millis(); return; }
-  if ((millis() - wsLastOkMs) > WS_RESTART_TIMEOUT_MS) {
-    Serial.println("WS_RESTART: sem WS por 30min. Reiniciando.");
+  // Peça sem rede configurada não tem para onde reconectar: reiniciar de 30 em
+  // 15min não resolve nada e só atrapalha quem estiver configurando. Idem
+  // durante um teste do wizard.
+  if (!hasSavedWiFi() || wifiTestActive) { wsLastOkMs = millis(); return; }
+  // Só adia o reinício enquanto o pulso está no ar — sem empurrar wsLastOkMs,
+  // que agora também é o relógio do backoff. Empurrá-lo aqui zeraria o downtime
+  // e jogaria o intervalo de reconexão de volta para 1s.
+  if (pulseActive) return;
+  if ((millis() - wsLastOkMs) > (WS_RESTART_TIMEOUT_MS + wsRestartJitterMs)) {
+    Serial.printf("WS_RESTART: sem WS por %lumin. Reiniciando.\n",
+                  (unsigned long)((WS_RESTART_TIMEOUT_MS + wsRestartJitterMs) / 60000UL));
     delay(200);
     ESP.restart();
   }
@@ -1055,7 +1424,17 @@ select option{background:var(--cd)}
     <div class="step" id="step3">
       <div class="sec">Opções — Industrial</div>
       <div class="chk"><input id="availEn" type="checkbox"><label for="availEn">Fail-safe AVAIL — confirma o ciclo e repulsa se a máquina não ligar</label></div>
-      <div class="chk"><input id="wsrestart" type="checkbox"><label for="wsrestart">Reiniciar automaticamente após 30min sem WebSocket</label></div>
+      <label>Potência de transmissão do rádio</label>
+      <select id="txpower">
+        <option value="78">19,5 dBm — máximo (padrão)</option>
+        <option value="68">17 dBm</option>
+        <option value="60">15 dBm — placa reprovada no teste de bancada</option>
+        <option value="52">13 dBm</option>
+        <option value="44">11 dBm</option>
+        <option value="34">8,5 dBm</option>
+      </select>
+      <div class="hint">Até salvar, a peça opera em <b>15 dBm</b> para garantir que o AP apareça em qualquer placa. Só reduza de forma permanente se esta unidade <b>falhou a 19,5 e passou a 15</b> no teste de bancada.</div>
+      <div class="hint">Reinício automático após 15min sem WebSocket: <b>sempre ativo</b>.</div>
       <div class="hint"><b>Modelos sem AVAIL: deixe o fail-safe desmarcado.</b> Os pinos (START IN / AVAIL OUT) usam os padrões e só são ajustados no Administrador.</div>
     </div>
   </div>
@@ -1134,7 +1513,7 @@ function save(){
     '&pass2='+encodeURIComponent(qs('pass2').value)+
     '&nodeid='+encodeURIComponent(qs('nodeid').value.trim())+
     '&availEn='+(qs('availEn').checked?1:0)+
-    '&wsrestart='+(qs('wsrestart').checked?1:0);
+    '&txpower='+qs('txpower').value;
   fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b})
     .then(r=>r.text()).then(t=>{msg(t+' Reconecte ao Wi-Fi em ~5s.');})
     .catch(()=>msg('Falha ao salvar.'));
@@ -1160,7 +1539,9 @@ window.onload=()=>{
     qs('ssid2').value=d.ssid2||''; qs('pass2').value=d.pass2||'';
     qs('nodeid').value=d.nodeid||'';
     qs('availEn').checked=(d.availEn===1);
-    qs('wsrestart').checked=(d.wsrestart===1);
+    // txpower 0 = nunca configurado: deixa 19,5 pre-selecionado, mesmo com a
+    // peca rodando no fail-safe de 15 ate alguem salvar.
+    qs('txpower').value = d.txpower ? String(d.txpower) : '78';
   }).catch(()=>{});
   scan();
   qs('t0').onclick=()=>{net1ok=false;testWifi(qs('manual_ssid').value.trim()||qs('ssid').value,qs('pass').value,'ts0',(ok)=>{net1ok=ok;});};
@@ -1246,8 +1627,18 @@ select option{background:var(--cd)}
   </div>
   <div class="box">
     <div class="sec">Avançado</div>
-    <div class="chk"><input id="wsrestart" type="checkbox"><label for="wsrestart">Auto-restart se 30min sem WebSocket</label></div>
-    <button class="btn" id="bAdv">Salvar avançado</button>
+    <label>Potência de transmissão do rádio</label>
+    <select id="txpower">
+      <option value="78">19,5 dBm — máximo (padrão)</option>
+      <option value="68">17 dBm</option>
+      <option value="60">15 dBm — placas com alimentação fraca</option>
+      <option value="52">13 dBm</option>
+      <option value="44">11 dBm</option>
+      <option value="34">8,5 dBm</option>
+    </select>
+    <div style="color:var(--mu);font-size:10px;line-height:1.5;margin:8px 0 0">Peça nunca configurada opera em <b>15 dBm</b> (garante que o AP apareça em qualquer placa) e mostra 19,5 aqui até você salvar. Só reduza de forma permanente em unidade <b>reprovada no teste de bancada</b> — associa a 15 dBm e falha a 19,5. Reduzir encurta o alcance de subida em ~4,5 dB sem alterar o RSSI, que mede a descida.</div>
+    <button class="btn" id="bAdv">Salvar potência</button>
+    <div style="color:var(--mu);font-size:10px;line-height:1.5;margin:10px 0">Auto-restart após 15min sem WebSocket: <b>sempre ativo</b> (não é mais configurável).</div>
     <div class="row"><button class="btn ghost" id="bRst">Reiniciar</button><button class="btn danger" id="bClr">Apagar tudo</button></div>
   </div>
   <div class="msg" id="msg"></div>
@@ -1264,7 +1655,8 @@ window.onload=()=>{
   fetch('/config-data').then(r=>r.json()).then(d=>{
     qs('nodeid').value=d.nodeid||''; qs('host').value=d.host||''; qs('port').value=d.port||80;
     qs('startPin').value=d.startPin!=null?d.startPin:4; qs('availPin').value=d.availPin!=null?d.availPin:2;
-    qs('availEn').checked=(d.availEn===1); qs('wsrestart').checked=(d.wsrestart===1);
+    qs('availEn').checked=(d.availEn===1);
+    qs('txpower').value = d.txpower ? String(d.txpower) : '78';   // 0 = nunca configurado
   }).catch(()=>{});
   scan();
   qs('bNode').onclick=()=>{if(!val('nodeid')){msg('Preencha o Node ID');return;}save({nodeid:val('nodeid')});};
@@ -1272,7 +1664,7 @@ window.onload=()=>{
   qs('bN1').onclick=()=>{let s=val('m1')||val('ssid');if(!s){msg('Escolha a rede 1');return;}save({ssid:s,pass:qs('p1').value});};
   qs('bN2').onclick=()=>{save({ssid2:(val('m2')||val('ssid2')),pass2:qs('p2').value});};
   qs('bPin').onclick=()=>{save({startPin:val('startPin')||4,availPin:val('availPin')||2,availEn:(qs('availEn').checked?1:0)});};
-  qs('bAdv').onclick=()=>{save({wsrestart:(qs('wsrestart').checked?1:0)});};
+  qs('bAdv').onclick=()=>{save({txpower:qs('txpower').value});};
   qs('bRst').onclick=()=>{if(confirm('Reiniciar o dispositivo?')){msg('Reiniciando…');fetch('/restart');}};
   qs('bClr').onclick=()=>{if(confirm('Apagar TODA a configuração e reiniciar?')){msg('Apagando…');fetch('/resetwifi');}};
 };
@@ -1326,7 +1718,9 @@ void handleConfigData() {
   json += "\"startPin\":"    + String(startPin) + ",";
   json += "\"availPin\":"    + String(availPin) + ",";
   json += "\"availEn\":"     + String(availEnabled ? 1 : 0) + ",";
-  json += "\"wsrestart\":"   + String(wsRestartEnabled ? 1 : 0);
+  // Valor GRAVADO, não o efetivo: 0 significa "nunca configurado", e é isso que
+  // permite às telas pré-selecionarem 19,5 enquanto a peça roda no fail-safe de 15.
+  json += "\"txpower\":"     + String(prefs.getInt("txpower", 0));
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -1345,10 +1739,14 @@ void handleSave() {
   if (server.hasArg("startPin")) { startPin = constrain(server.arg("startPin").toInt(), 0, 21); prefs.putInt("startPin", startPin); any = true; }
   if (server.hasArg("availPin")) { availPin = constrain(server.arg("availPin").toInt(), 0, 21); prefs.putInt("availPin", availPin); any = true; }
   if (server.hasArg("availEn"))  { availEnabled = server.arg("availEn").toInt() == 1; prefs.putInt("availEn", availEnabled ? 1 : 0); any = true; }
-  if (server.hasArg("wsrestart")){ wsRestartEnabled = server.arg("wsrestart").toInt() == 1; prefs.putInt("wsrestart", wsRestartEnabled ? 1 : 0); any = true; }
+  // txpower em quartos de dBm (unidade do enum wifi_power_t). O constrain evita
+  // que um valor absurdo vindo da URL desligue o rádio da peça em campo.
+  if (server.hasArg("txpower"))  { int q = constrain(server.arg("txpower").toInt(), TXPOWER_MIN_Q, TXPOWER_MAX_Q); txPower = (wifi_power_t)q; prefs.putInt("txpower", q); any = true; }
+  // "wsrestart" saiu de cena: o auto-restart passou a ser incondicional. A chave
+  // antiga na NVS é simplesmente ignorada, então peças já configuradas não
+  // precisam ser mexidas — inclusive as que tinham o valor salvo como 0.
 
   if (server.hasArg("ssid") || server.hasArg("ssid2")) wifiSlot = 0;
-  prefs.putUInt("bootCount", bootCount);
 
   server.send(200, "text/plain", any ? "Configurado. Reiniciando..." : "Nada para salvar.");
   if (any) { delay(400); ESP.restart(); }
@@ -1361,6 +1759,9 @@ void handleStatusJson() {
   json += "\"nodeId\":\""     + nodeId + "\",";
   json += "\"ssid\":\""       + (staOk ? WiFi.SSID() : String("")) + "\",";
   json += "\"rssi\":"         + String(staOk ? WiFi.RSSI() : 0) + ",";
+  // Leitura de volta do rádio (não o valor pedido) — é como se confere em campo
+  // se o limite de potência está mesmo valendo. -1 = rádio ainda não iniciado.
+  json += "\"txp\":"          + String(radioStarted() ? WiFi.getTxPower() / 4.0 : -1.0, 1) + ",";
   json += "\"ip_sta\":\""     + (staOk ? WiFi.localIP().toString() : String("")) + "\",";
   json += "\"ip_ap\":\""      + WiFi.softAPIP().toString() + "\",";
   json += "\"wsConnected\":"  + String(isWebSocketConnected ? "true" : "false") + ",";
@@ -1378,6 +1779,11 @@ void handleStatusJson() {
   json += "\"availEn\":"      + String(availEnabled ? 1 : 0) + ",";
   json += "\"creditState\":"  + String((int)creditState) + ",";
   json += "\"wifiSlot\":"     + String(wifiSlot) + ",";
+  json += "\"rst\":\""        + String(resetReasonStr()) + "\",";
+  // Caixa-preta no /status: o /info já despeja este JSON inteiro no bloco final,
+  // então quem está na frente da peça lê o histórico ANTES de reiniciar — que é
+  // exatamente o momento em que ele seria perdido se dependesse só do envio.
+  json += "\"blackbox\":"     + evJson() + ",";
   json += "\"boots\":"        + String(bootCount);
   json += "}";
   server.send(200, "application/json", json);
