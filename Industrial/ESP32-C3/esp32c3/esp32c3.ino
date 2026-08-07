@@ -43,6 +43,9 @@
 //   /status, que é leitura de volta do rádio.
 // - Dual WiFi com failover automático entre rede 1 e rede 2 (sem restart)
 // - Conexão não-bloqueante: wifiTick() com timeout 40s e retry a cada 5s
+// - Escada de associação: 2 falhas → disconnect(true) (reset de pilha);
+//   3 falhas → derruba o AP (rádio único: AP e STA dividem canal)
+// - O softAP sobe no canal da última conexão OK (NVS "wifich"), não em 1 fixo
 // - Credenciais NUNCA apagadas por falha de conexão
 //
 // WEBSOCKET:
@@ -50,8 +53,9 @@
 // - Reconexão feita pela lib, com backoff 1s→30s empurrado via
 //   setReconnectInterval() (sem isso ela martela a cada 500ms, o default dela)
 // - Escada de recuperação, tudo automático e sem depender de configuração:
-//     >5min sem WS (WiFi de pé) → reinicia só o WebSocket
-//     >10min                    → failover de WiFi (troca de rede)
+//     5 falhas de handshake     → reset da pilha de WiFi (imediato)
+//     >3min sem WS (WiFi de pé) → reset da pilha de WiFi
+//     >6min                     → failover de rede + alterna a potência de TX
 //     >8min sem WiFi nem WS     → failover de WiFi
 //     >15min sem WS             → REINICIA a peça (+ jitter de até 3min por peça,
 //                                 para a frota não reiniciar toda no mesmo instante)
@@ -87,7 +91,7 @@
 #include <Update.h>
 #include <mbedtls/sha256.h>
 
-#define FW_VERSION "1.1.0"   // reportado no 0x03 para auditoria da frota
+#define FW_VERSION "1.2.0"   // reportado no 0x03 para auditoria da frota
 #define FW_CHIP    "esp32c3" // identifica o chip na telemetria / seleção de OTA
 
 // ---------- Potência de transmissão do rádio ----------
@@ -121,8 +125,24 @@
 // Enum, em quartos de dBm: 19,5=78 · 17=68 · 15=60 · 13=52 · 11=44 · 8,5=34 · 5=20
 const int TXPOWER_MIN_Q  =  8;   // 2 dBm — piso de sanidade
 const int TXPOWER_MAX_Q  = 78;   // 19,5 dBm
-const int TXPOWER_BOOT_Q = 60;   // 15 dBm — usado enquanto a NVS não tem valor
-wifi_power_t txPower = (wifi_power_t)TXPOWER_BOOT_Q;
+const int TXPOWER_BOOT_Q = 60;   // 15 dBm — fail-safe de peça virgem
+wifi_power_t txPower = (wifi_power_t)TXPOWER_BOOT_Q;   // alvo configurado
+
+// Fallback automático de potência. Depois de falha sustentada de conexão, a peça
+// passa a tentar o OUTRO nível — e fica no que funcionar. Cobre os dois sentidos:
+// placa do lote fraco presa em 19,5 dBm cai para 15 e conecta; placa boa em ponto
+// de sinal ruim, presa em 15, sobe para 19,5 e conecta.
+//
+// É diferente de escolher a potência por um teste no boot, que dá falso positivo
+// em placa marginal: aqui só agimos após minutos de falha real, e o critério é o
+// único que importa — conectou ou não. Nada é gravado na NVS: se a peça reiniciar,
+// volta ao valor configurado.
+bool txPowerFallback = false;
+wifi_power_t activeTxPower() {
+  if (!txPowerFallback) return txPower;
+  return (txPower > (wifi_power_t)TXPOWER_BOOT_Q) ? (wifi_power_t)TXPOWER_BOOT_Q
+                                                  : (wifi_power_t)TXPOWER_MAX_Q;
+}
 
 // ---------- Reafirmação da potência ----------
 // Com txPower no máximo (o padrão) isto é inócuo: nada fica ACIMA de 19,5. Passa
@@ -150,9 +170,10 @@ bool radioStarted() { return WiFi.STA.started() || WiFi.AP.started(); }
 // checagem de radioStarted() vem antes — sem ela, leríamos um valor inventado.
 bool applyTxPower() {
   if (!radioStarted()) return false;
-  if (WiFi.getTxPower() <= txPower) return true;
-  WiFi.setTxPower(txPower);
-  return WiFi.getTxPower() <= txPower;
+  wifi_power_t alvo = activeTxPower();
+  if (WiFi.getTxPower() <= alvo) return true;
+  WiFi.setTxPower(alvo);
+  return WiFi.getTxPower() <= alvo;
 }
 
 void txPowerTick() {
@@ -160,10 +181,11 @@ void txPowerTick() {
   lastTxPowerCheckMs = millis();
   if (!radioStarted()) return;
   wifi_power_t cur = WiFi.getTxPower();
-  if (cur > txPower) {
+  wifi_power_t alvo = activeTxPower();
+  if (cur > alvo) {
     Serial.printf("TXPOWER: %.1f dBm fora do alvo, reaplicando %.1f dBm\n",
-                  cur / 4.0, txPower / 4.0);
-    WiFi.setTxPower(txPower);
+                  cur / 4.0, alvo / 4.0);
+    WiFi.setTxPower(alvo);
   }
 }
 
@@ -215,6 +237,25 @@ const char* activeSSID() { return wifiSlot == 0 ? sSsid.c_str() : sSsid2.c_str()
 const char* activePass() { return wifiSlot == 0 ? sPass.c_str() : sPass2.c_str(); }
 bool hasSavedWiFi()      { return strlen(activeSSID()) > 0; }
 
+// ---------- Recuperação de WiFi ----------
+// O rádio do ESP32-C3 é um só: em AP+STA as duas interfaces dividem o mesmo canal.
+// Com o softAP fixo num canal e a rede alvo em outro, a associação simplesmente não
+// completa — foi o que travou uma peça por 10 minutos em bancada, e só destravou
+// quando o AP expirou. Guardamos o canal da última conexão bem-sucedida para subir
+// o AP já casado com a rede; se ainda assim falhar, derrubamos o AP.
+int      wifiChannelHint = 0;    // canal da última conexão OK (0 = desconhecido)
+uint8_t  wifiFailStreak  = 0;    // tentativas de associação falhadas em sequência
+const uint8_t WIFI_FAIL_HARD_RESET = 2;   // após N falhas, desliga o rádio (disconnect(true))
+const uint8_t WIFI_FAIL_DROP_AP    = 3;   // após N falhas, derruba o AP e tenta em STA puro
+const uint32_t AP_INSTALL_GRACE_MS = 3UL * 60UL * 1000UL;  // AP intocável neste período
+
+// Handshakes de WebSocket que morreram em sequência sem completar. O sintoma é
+// inequívoco (TCP abre, o "HTTP/1.1 101" nunca chega) e a cura é conhecida: só o
+// reset da pilha de WiFi resolve — reiniciar o WebSocket não adianta. Não faz
+// sentido esperar o watchdog quando o diagnóstico já está fechado.
+uint8_t  wsHandshakeFailStreak = 0;
+const uint8_t WS_HANDSHAKE_FAIL_RESET = 5;
+
 // ---------- AP ----------
 IPAddress apIP(192,168,4,1);
 const uint32_t AP_LIFETIME_MS = 10UL * 60UL * 1000UL;
@@ -251,10 +292,16 @@ bool isWebSocketConnected = false;
 // mais que isso sem tentar, mesmo depois de horas fora.
 uint32_t wsRetryIntervalMs = 0;   // último valor empurrado para a lib
 bool     wsBegun = false;         // begin() já rodou ao menos uma vez?
+// Pedido de reset da pilha vindo do callback do WS. Enfileirado de propósito: o
+// fullReconnectWiFiWS() destrói o socket cujo callback estaria em execução.
+bool     wsResetRequested = false;
 
+// Piso de 3s, não 1s. Cada tentativa abre um socket TCP que fica preso em
+// TIME_WAIT por ~60s, e o lwIP do ESP32 tem poucos PCBs: retentar rápido demais
+// esgota o pool e passa a impedir até o handshake — uma espiral que só o reset da
+// pilha desfaz. 3s ainda devolve a conexão em segundos num blip.
 uint32_t wsBackoffFor(uint32_t downMs) {
-  if (downMs <  10000UL) return  1000UL;
-  if (downMs <  30000UL) return  2000UL;
+  if (downMs <  30000UL) return  3000UL;
   if (downMs <  60000UL) return  5000UL;
   if (downMs < 300000UL) return 10000UL;
   return 30000UL;
@@ -278,7 +325,9 @@ const uint32_t APP_PING_INTERVAL_MS = 30UL * 1000UL;
 // ---------- Watchdogs ----------
 uint8_t  wsDownEscalation = 0;   // 0 = próxima ação é reiniciar só o WS; 1 = failover de WiFi
 uint32_t wsDownSinceMs = 0;
-const uint32_t WS_DOWN_RESET_MS = 5UL * 60UL * 1000UL;
+// 3min, não 5: a medição de bancada mostrou que a peça fica inalcançável o tempo
+// inteiro dessa janela, e a ação (reset da pilha) leva 2 segundos e é inócua.
+const uint32_t WS_DOWN_RESET_MS = 3UL * 60UL * 1000UL;
 uint32_t lastConnectivityOkMs = 0;
 const uint32_t GLOBAL_DOWN_RESET_MS = 8UL * 60UL * 1000UL;
 
@@ -596,20 +645,30 @@ void loadPrefs() {
   startPin         = prefs.getInt("startPin", startPin);
   availPin         = prefs.getInt("availPin", availPin);
   availEnabled     = (prefs.getInt("availEn", 0) != 0);
+  wifiChannelHint  = prefs.getInt("wifich", 0);
   // 0 = chave ausente (nenhum valor válido é 0). Peça nunca configurada fica no
   // fail-safe de 15 dBm, garantindo que o AP suba em qualquer placa.
+  // Sem chave gravada (0), o padrão depende de a peça já estar instalada ou não:
+  //  - SEM WiFi salvo  → peça virgem/bancada → 15 dBm, para o AP subir em qualquer
+  //    placa e ela poder ser configurada.
+  //  - COM WiFi salvo  → peça em produção que veio de um OTA → 19,5 dBm, que é o
+  //    que ela já usava. Rebaixá-la por causa de um fail-safe pensado para peça
+  //    nova derrubaria instalações que funcionavam.
   int txq          = prefs.getInt("txpower", 0);
   txPower          = (wifi_power_t)(txq ? constrain(txq, TXPOWER_MIN_Q, TXPOWER_MAX_Q)
-                                        : TXPOWER_BOOT_Q);
+                                        : (hasSavedWiFi() ? TXPOWER_MAX_Q : TXPOWER_BOOT_Q));
   bootCount        = prefs.getUInt("bootCount",   0);
 }
 
 // ================= AP + STA =================
 void setupAPSTA() {
   WiFi.mode(WIFI_AP_STA);
-  WiFi.setTxPower(txPower);
+  WiFi.setTxPower(activeTxPower());
   String apName = nodeId + "-AP";
-  WiFi.softAP(apName.c_str(), "12345678", 1, false);
+  // Canal da última conexão bem-sucedida, não 1 fixo: em AP+STA o rádio é único e
+  // um AP em canal diferente do roteador impede a associação do STA.
+  int apCh = (wifiChannelHint >= 1 && wifiChannelHint <= 13) ? wifiChannelHint : 1;
+  WiFi.softAP(apName.c_str(), "12345678", apCh, false);
   delay(200);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
   // Segunda aplicação, agora com o AP no ar: a de cima roda logo após o mode() e
@@ -618,8 +677,8 @@ void setupAPSTA() {
   applyTxPower();
   // O tx= é leitura real do rádio; -1 quando nenhuma interface subiu ainda (nesse
   // caso getTxPower() devolveria 19,5 de fallback e o log mentiria).
-  Serial.printf("AP: %s | IP: %s | tx=%.1fdBm\n", apName.c_str(),
-                WiFi.softAPIP().toString().c_str(),
+  Serial.printf("AP: %s | IP: %s | ch=%d | tx=%.1fdBm\n", apName.c_str(),
+                WiFi.softAPIP().toString().c_str(), apCh,
                 radioStarted() ? WiFi.getTxPower() / 4.0 : -1.0);
 }
 
@@ -921,6 +980,7 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       lastPingMs  = millis();
       wsLastOkMs  = millis();
       wsDownSinceMs = 0;
+      wsHandshakeFailStreak = 0;
       evAdd(EV_WS_UP, 0);
       String msg = pulseActive ? ("ID:" + nodeId) : ("NID:" + nodeId);
       webSocket.sendTXT(msg);
@@ -943,7 +1003,19 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
     case WStype_DISCONNECTED:
       isWebSocketConnected = false;
       evAdd(EV_WS_DOWN, 0);
-      Serial.println("WS desconectado. Retentativa a cargo da lib (backoff em wsTick).");
+      // Este evento também dispara quando o handshake NUNCA completou: o
+      // clientDisconnect() da lib emite WStype_DISCONNECTED sempre que há socket
+      // para fechar, inclusive no "Header response timeout" (TCP abre, o 101 não
+      // vem). Vários seguidos sem nenhum WStype_CONNECTED no meio = pilha de rede
+      // travada, e aí só o reset resolve — sem esperar o watchdog.
+      if (wsHandshakeFailStreak < 250) wsHandshakeFailStreak++;
+      Serial.printf("WS desconectado (%u seguidas). Retentativa a cargo da lib.\n",
+                    wsHandshakeFailStreak);
+      if (wsHandshakeFailStreak >= WS_HANDSHAKE_FAIL_RESET) {
+        wsHandshakeFailStreak = 0;
+        Serial.println("WS: falhas seguidas de handshake. Reset da pilha de WiFi.");
+        wsResetRequested = true;   // executado no wsTick, fora do callback
+      }
       break;
 
     case WStype_PING:
@@ -1134,12 +1206,46 @@ void wifiTick() {
   if (wifiConnecting) {
     if (WiFi.status() == WL_CONNECTED) {
       wifiConnecting = false;
-      Serial.printf("WiFi conectado. IP=%s\n", WiFi.localIP().toString().c_str());
+      wifiFailStreak = 0;
+      // Guarda o canal para o próximo boot subir o AP já casado com o roteador.
+      int ch = WiFi.channel();
+      if (ch >= 1 && ch <= 13 && ch != wifiChannelHint) {
+        wifiChannelHint = ch;
+        prefs.putInt("wifich", ch);
+      }
+      Serial.printf("WiFi conectado. IP=%s ch=%d\n",
+                    WiFi.localIP().toString().c_str(), ch);
       if (!isWebSocketConnected) connectToWebSocket();
     } else if ((millis() - wifiConnectStartMs) > WIFI_MAX_WAIT_MS) {
       wifiConnecting = false;
-      Serial.println("WiFi timeout. Tentará novamente.");
-      WiFi.disconnect(false);
+      if (wifiFailStreak < 250) wifiFailStreak++;
+      Serial.printf("WiFi timeout (%u seguidas). Tentará novamente.\n", wifiFailStreak);
+
+      // Escalonamento. Antes eram N tentativas idênticas: disconnect(false) +
+      // begin(), repetido para sempre. Em bancada foram 14 falhas iguais em 10
+      // minutos — repetir a mesma coisa não tira o STA de um estado travado.
+      // A janela inicial é intocável: derrubar o AP após ~2min deixaria o
+      // instalador sem acesso no meio da configuração, justamente quando o Wi-Fi
+      // ainda está errado e falhando. Só depois disso vale trocar o AP pelo rádio.
+      bool janelaDoInstalador = (millis() - bootTimeMs) < AP_INSTALL_GRACE_MS;
+      if (wifiFailStreak >= WIFI_FAIL_DROP_AP && apEnabled && !janelaDoInstalador) {
+        // O AP é a causa mais provável: rádio único, canais diferentes. Derrubá-lo
+        // libera o STA para associar em qualquer canal.
+        Serial.println("WiFi: derrubando o AP para liberar o radio.");
+        WiFi.softAPdisconnect(true);
+        apEnabled = false;
+        lastConnectivityOkMs = millis();
+        applyTxPower();
+      }
+      if (wifiFailStreak >= WIFI_FAIL_HARD_RESET) {
+        // disconnect(true) derruba a interface (esp_wifi_stop) e libera os PCBs
+        // do lwIP; disconnect(false) só solta a associação e mantém o travamento.
+        Serial.println("WiFi: reset da pilha (disconnect(true)).");
+        WiFi.disconnect(true);
+        delay(100);
+      } else {
+        WiFi.disconnect(false);
+      }
     }
   }
 
@@ -1177,6 +1283,14 @@ void wsTick() {
     applyWsBackoff(millis() - wsLastOkMs);
   }
 
+  // Reset pedido pelo callback (handshakes falhando em série). Executado aqui,
+  // fora do callback, para não derrubar o socket de dentro do próprio evento.
+  if (wsResetRequested) {
+    wsResetRequested = false;
+    fullReconnectWiFiWS();
+    return;
+  }
+
   // A partir daqui quem retenta é a lib, no ritmo do backoff. Este bloco só
   // garante que o begin() rodou uma vez com WiFi de pé — antes existia aqui uma
   // segunda camada de retentativa que disputava com a da lib e, de 10 em 10s,
@@ -1192,25 +1306,34 @@ void watchdogTick() {
     bool wifiOk = (WiFi.status() == WL_CONNECTED);
     bool wsOk   = isWebSocketConnected;
 
-    // Escalonamento. Antes, "WS fora com WiFi de pé" já caía direto no failover
-    // de Wi-Fi — o que é a pior reação possível para esse diagnóstico: o Wi-Fi
-    // está funcionando por definição, então o problema é do outro lado
-    // (servidor, internet do prédio, DNS), e trocar de rede só faz a peça
-    // abandonar uma rede boa e depender do watchdog global de 8 min para voltar.
-    // Agora a primeira ação reinicia só o WebSocket; o failover de Wi-Fi fica
-    // para a segunda janela, quando reiniciar o WS já se mostrou insuficiente.
+    // Escalonamento, corrigido em cima de medição de bancada. A versão anterior
+    // reiniciava só o WebSocket na primeira janela — e isso comprovadamente NÃO
+    // resolve: 7 tentativas seguidas falharam, e a conexão só voltou (em 2s) quando
+    // o passo seguinte derrubou a pilha de WiFi. O WebSocket não era o problema;
+    // ele está em cima de uma pilha travada que se declara conectada.
+    //
+    // Então a primeira ação passa a ser o reset da pilha — que, com uma única rede
+    // salva, é exatamente o que fullReconnectWiFiWS() faz, sem trocar de rede
+    // nenhuma. Trocar de slot fica para a segunda janela, e só se houver ssid2.
     if (wifiOk && !wsOk) {
       if (wsDownSinceMs == 0) wsDownSinceMs = millis();
       if ((millis() - wsDownSinceMs) > WS_DOWN_RESET_MS) {
         wsDownSinceMs = millis();
         if (wsDownEscalation == 0) {
-          Serial.println("WATCHDOG: WS down >5min. Reiniciando so o WebSocket.");
+          Serial.println("WATCHDOG: WS down. Reset da pilha de WiFi.");
           wsDownEscalation = 1;
           evAdd(EV_WD_WS, 0);
-          connectToWebSocket();
+          fullReconnectWiFiWS();
         } else {
-          Serial.println("WATCHDOG: WS down >10min. Failover de WiFi.");
+          Serial.println("WATCHDOG: WS down persistente. Failover + fallback de potencia.");
           wsDownEscalation = 0;
+          // Alterna a potência: se o problema for a placa não sustentar o TX (ou o
+          // contrário, sinal fraco demais para a potência reduzida), o outro nível
+          // resolve. Não grava na NVS — é tentativa, não configuração.
+          txPowerFallback = !txPowerFallback;
+          Serial.printf("TXPOWER: fallback %s -> alvo %.1f dBm\n",
+                        txPowerFallback ? "ligado" : "desligado",
+                        activeTxPower() / 4.0);
           evAdd(EV_WD_FAIL, (int16_t)wifiSlot);
           failoverReconnect();
         }
