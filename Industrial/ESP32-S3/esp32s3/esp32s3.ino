@@ -1,87 +1,145 @@
 // ============================================================================
-// Foreasy ESP32-C3 Super Mini — Industrial
-// Hardware: ESP32-C3 + saída START IN (Industrial)
+// Foreasy ESP32-S3 - Industrial
+// Hardware: ESP32-S3 DevKit + saida START IN
+//   Em uso: N8R2 (8MB flash / 2MB PSRAM). Previsto: N16R8 (16MB / 8MB).
+//   A mesma imagem serve as duas - o que muda sao duas opcoes de build (ver BUILD).
 //
-// PÁGINAS WEB: somente /config (wizard) e /info (status). "/" redireciona p/ /config.
+// Porte do firmware ESP32-C3 1.3.0 (Industrial/ESP32-C3/esp32c3/esp32c3.ino).
+// A logica de negocio, o protocolo e as telas sao os MESMOS - o que muda e o que
+// e especifico do chip: pinos, LED, validacao de GPIO, USB CDC e a politica de
+// potencia de radio. Ao corrigir um bug de logica, corrija nos dois.
 //
-// SISTEMA: Industrial — pulso de START IN + leitura do AVAIL OUT (Speed Queen).
+// POR QUE ESTA PLACA: o lote de ESP32-C3 Super Mini do segundo fornecedor nao
+// sustenta o pico de corrente do TX em potencia cheia - a peca enxerga a rede mas
+// nao associa e nem sobe o proprio AP (docs/LAUDO-LOTE-ESP32C3.md). O S3 DevKit
+// tem regulador e desacoplamento dimensionados para o modulo, entao aqui a peca
+// opera em 19,5 dBm por padrao.
+//
+// PAGINAS WEB: "/" (menu), /wizard (= /config), /admin e /info.
+//
+// SISTEMA: Industrial - pulso de START IN + leitura do AVAIL OUT (Speed Queen).
 //   Pulso de START IN (Speed Queen, conector H3-7) via GPIO direto (startPin).
-//   GPIO sobe por PULSE_MS (100ms) e desce — igual esp32_avail.
+//   GPIO sobe por PULSE_MS (100ms) e desce.
 //   WS 0x01 => dispara pulso | WS 0x02 => ignorado
 //
-//   FAIL-SAFE AVAIL (availEnabled — opcional; modelos sem AVAIL deixam OFF):
-//   máquina LIVRE (AVAIL LOW) → pulso → confirma LIVRE→OCUPADA (AVAIL HIGH) em até
-//   CREDIT_CONFIRM_MS; se não confirmar, repulsa após CREDIT_GAP_MS, até
-//   CREDIT_MAX_ATTEMPTS tentativas. Resposta assíncrona ao backend:
-//   "RelayStatus:ON" (sucesso) | "CreditFail" (esgotou) | "CreditBusy" (já ocupada).
-//   Sem availEnabled: comportamento antigo (um pulso, sem confirmação).
+//   FAIL-SAFE AVAIL (availEnabled - opcional; modelos sem AVAIL deixam OFF):
+//   maquina LIVRE (AVAIL LOW) -> pulso -> confirma LIVRE->OCUPADA (AVAIL HIGH) em
+//   ate CREDIT_CONFIRM_MS; se nao confirmar, repulsa apos CREDIT_GAP_MS, ate
+//   CREDIT_MAX_ATTEMPTS tentativas. Resposta assincrona ao backend:
+//   "RelayStatus:ON" (sucesso) | "CreditFail" (esgotou) | "CreditBusy" (ja ocupada).
+//   Sem availEnabled: um pulso so, sem confirmacao.
 //
-// PROTOCOLO WEBSOCKET (binário):
+// PROTOCOLO WEBSOCKET (binario):
 // - 0x01 => pulso START IN 100ms
 // - 0x02 => ignorado
 // - 0x03 => JSON: rssi, ch, heap, block, cpu, uptime, boots, wifiSlot, temp, machineMode, pulse, chip, fw
 // - 0x04 => OTA: payload = 0x04 + "url|sha256" (sha256 opcional, 64 hex). Baixa o .bin,
 //           grava com Update, valida SHA256 e reinicia. Respostas async:
-//           "OTA:QUEUED" → "OTA:START" → "OTA:OK:restart" | "OTA:FAIL:<motivo>"
+//           "OTA:QUEUED" -> "OTA:START" -> "OTA:OK:restart" | "OTA:FAIL:<motivo>"
 // - 0x05 => JSON status do AVAIL: {"type":"avail","livre":bool,"raw":-1/0/1,
 //           "sinceMs":ms,"availEn":0/1,"machineMode":1}
-// - 0x06 => Restart remoto. Responde "Restarting" e reinicia após ~300ms.
+// - 0x06 => Restart remoto. Responde "Restarting" e reinicia apos ~300ms.
 //
-// DETECÇÃO DE FICHA (token) — só com availEnabled e creditState IDLE (§11):
-// - "TokenInserted" : AVAIL LOW→HIGH externo (ficha) ou snapshot ocupado no connect
-// - "TokenFinished" : AVAIL HIGH→LOW externo ou snapshot livre no connect
-//   O backend cruza com is_in_use antes de marcar a ficha (não toca is_in_use).
+// DETECCAO DE FICHA (token) - so com availEnabled e creditState IDLE:
+// - "TokenInserted" : AVAIL LOW->HIGH externo (ficha) ou snapshot ocupado no connect
+// - "TokenFinished" : AVAIL HIGH->LOW externo ou snapshot livre no connect
+//   O backend cruza com is_in_use antes de marcar a ficha (nao toca is_in_use).
 //
 // WIFI:
-// - Potência de TX configurável por peça no wizard e no /admin (NVS "txpower").
-//   Peça sem nada salvo opera em 15 dBm — fail-safe para que o AP suba mesmo nas
-//   placas do lote fraco, que a 19,5 dBm não emitem beacon. As telas vêm com
-//   19,5 pré-selecionado, então a configuração normal sobe a peça para potência
-//   cheia; só as reprovadas em bancada ficam em 15. Reafirmada a cada 5s
-//   (txPowerTick), porque toda troca de modo devolve o rádio ao máximo —
-//   inclusive o softAPdisconnect() do fim do AP. Confira pelo campo "txp" em
-//   /status, que é leitura de volta do rádio.
-// - Dual WiFi com failover automático entre rede 1 e rede 2 (sem restart)
-// - Conexão não-bloqueante: wifiTick() com timeout 40s e retry a cada 5s
-// - Escada de associação: 2 falhas → disconnect(true) (reset de pilha);
-//   3 falhas → derruba o AP (rádio único: AP e STA dividem canal)
-// - O softAP sobe no canal da última conexão OK (NVS "wifich"), não em 1 fixo
-// - Credenciais NUNCA apagadas por falha de conexão
+// - Potencia de TX configuravel por peca no /admin (NVS "txpower"). Nesta placa o
+//   padrao e 19,5 dBm (potencia cheia) - ver o bloco de comentario da secao.
+//   Reafirmada a cada 5s (txPowerTick), porque toda troca de modo devolve o radio
+//   ao maximo. Confira pelo campo "txp" em /status, que e leitura de volta do radio.
+// - Dual WiFi com failover automatico entre rede 1 e rede 2 (sem restart)
+// - Conexao nao-bloqueante: wifiTick() com timeout 40s e retry a cada 5s
+// - Escada de associacao: 2 falhas -> disconnect(true) (reset de pilha);
+//   3 falhas -> derruba o AP (radio unico: AP e STA dividem canal)
+// - O softAP sobe no canal da ultima conexao OK (NVS "wifich"), nao em 1 fixo
+// - Credenciais NUNCA apagadas por falha de conexao
 //
 // WEBSOCKET:
-// - Servidor (host/porta) configurável apenas via /admin e salvo na NVS
-// - Reconexão feita pela lib, com backoff 1s→30s empurrado via
+// - Servidor (host/porta) configuravel apenas via /admin e salvo na NVS
+// - Reconexao feita pela lib, com backoff 3s->30s empurrado via
 //   setReconnectInterval() (sem isso ela martela a cada 500ms, o default dela)
-// - Escada de recuperação, tudo automático e sem depender de configuração:
-//     5 falhas de handshake     → reset da pilha de WiFi (imediato)
-//     >3min sem WS (WiFi de pé) → reset da pilha de WiFi
-//     >6min                     → failover de rede + alterna a potência de TX
-//     >8min sem WiFi nem WS     → failover de WiFi
-//     >15min sem WS             → REINICIA a peça (+ jitter de até 3min por peça,
-//                                 para a frota não reiniciar toda no mesmo instante)
-// - Detecção de zumbi : sem ping/pong por >5min → reconecta
+// - Escada de recuperacao, tudo automatico e sem depender de configuracao:
+//     5 falhas de handshake     -> reset da pilha de WiFi (imediato)
+//     >3min sem WS (WiFi de pe) -> reset da pilha de WiFi
+//     >6min                     -> failover de rede + alterna a potencia de TX
+//     >8min sem WiFi nem WS     -> failover de WiFi
+//     >15min sem WS             -> REINICIA a peca (+ jitter de ate 3min por peca)
+// - Deteccao de zumbi : sem ping/pong por >5min -> reconecta
 // - App ping a cada 30s | heartbeat: 15s/3s/2 tentativas
 //
-// AP: ativo 10 min após boot (lean mode após expirar)
+// AP: ativo 10 min apos boot (lean mode apos expirar)
 //     SSID: <nodeId>-AP | Senha: 12345678
 //
-// ARMAZENAMENTO: Preferences (NVS) — ssid, pass, ssid2, pass2, nodeid,
-//                wsHost, wsPort, startPin, availPin, availEn, txpower, bootCount
-// bootCount é gravado a cada boot (é o que permite detectar reinícios na frota)
+// ARMAZENAMENTO: Preferences (NVS) - ssid, pass, ssid2, pass2, nodeid,
+//                wsHost, wsPort, startPin, availPin, availEn, ledPin, ledMode,
+//                txpower, wifich, bootCount, evlog
 //
-// SCAN WIFI: assíncrono (não bloqueia o loop)
-// TEMPERATURA: sensor interno do ESP32-C3 via temperatureRead()
+// SCAN WIFI: assincrono (nao bloqueia o loop)
+// TEMPERATURA: sensor interno do ESP32-S3 via temperatureRead()
 //
-// PINOS (configuráveis só no /admin; strapping ESP32-C3: GPIO2, GPIO8, GPIO9):
-// - ledPin   : GPIO8  (fixo — LED azul integrado, ATIVO LOW)
-// - startPin : GPIO4  (START IN, ativo HIGH)
-// - availPin : GPIO2  (AVAIL OUT, INPUT_PULLUP)
+// ---------------------------------------------------------------------------
+// PINOS (configuraveis no /admin) - padroes desta placa:
+// - startPin : GPIO5  (START IN, ativo HIGH)
+// - availPin : GPIO6  (AVAIL OUT, INPUT_PULLUP)
+// - ledPin   : GPIO48 em modo RGB (LED WS2812 embutido do DevKit)
 //
-// ATENÇÃO LED: GPIO8 tem o LED azul integrado do Super Mini (ativo LOW).
-//   Conectado = LOW (LED aceso) | Desconectado = HIGH (LED apagado).
-//   Para usar LED externo em outro GPIO, troque ledPin no wizard e ajuste a lógica.
+// GPIOs PROIBIDOS no S3 - gpioLivre() recusa no /save, entao um engano de
+// digitacao nao derruba a peca em campo:
+// - 22, 23, 24, 25 : nao existem neste chip
+// - 26 a 32        : barramento da flash SPI embutida (usar = a peca nao da boot)
+// - 33 a 37        : barramento da PSRAM octal. So a variante R8 ocupa esses pinos
+//                    (na R2 a PSRAM e quad e divide o barramento da flash), mas
+//                    eles ficam bloqueados em TODAS as placas de proposito - ver
+//                    a nota em gpioLivre()
+// - 19, 20         : USB D-/D+ (porta nativa; usar derruba a USB e o CDC)
+// Usaveis com ressalva (aceitos, mas evite): 0/3/45/46 sao strapping (definem modo
+// de boot e tensao da flash) e 43/44 sao a UART0, que e o console serial.
+//
+// LED (ledMode, NVS): 0=desligado - 1=comum ativo HIGH - 2=comum ativo LOW -
+// 3=RGB WS2812 (padrao). O DevKit N16R8 nao tem LED monocromatico de usuario: o
+// unico LED controlavel e o RGB enderecavel, e a maioria das placas o traz no
+// GPIO48 (algumas revisoes usam o 38 - dai o pino ser configuravel).
+// Verde = WebSocket conectado | vermelho = sem WebSocket.
+//
+// ---------------------------------------------------------------------------
+// BUILD (Arduino IDE / arduino-cli) - a placa e "ESP32S3 Dev Module".
+//
+// A FLASH SELECIONADA TEM DE BATER COM O CHIP REAL. Marcar 16MB numa placa de
+// 8MB compila e grava sem reclamar: quem reclama e o bootloader, comparando o
+// cabecalho da imagem com o chip, e o resultado e panico em loop antes de o
+// sketch rodar uma linha -
+//     E (235) spi_flash: Detected size(8192k) smaller than the size in the
+//     binary image header(16384k). Probe failed.
+//     assert failed: __esp_system_init_fn_init_flash startup_funcs.c:118
+// E facil cair nisso: estes DevKits sao anunciados como N16R8 e chegam N8R2.
+// Confira no log de boot ou com `esptool --port <COM> flash-id` - nao no anuncio.
+//
+//   N8R2 (8MB flash / 2MB PSRAM) - a placa em uso:
+//     Flash Size ...... 8MB (64Mb)
+//     Partition ....... 8M with spiffs (3MB APP/1.5MB SPIFFS)  [2 slots de 3,2MB]
+//
+//   N16R8 (16MB flash / 8MB PSRAM):
+//     Flash Size ...... 16MB (128Mb)
+//     Partition ....... 16M Flash (3MB APP/9.9MB FATFS)        [2 slots de 3MB]
+//
+//   Comum as duas:
+//     PSRAM ........... Disabled (o firmware nao usa)
+//     USB CDC On Boot . Enabled se grava/monitora pela porta USB NATIVA;
+//                       Disabled se usa a porta do conversor UART da placa
+//
+//   arduino-cli compile --fqbn
+//     esp32:esp32:esp32s3:FlashSize=8M,PartitionScheme=default_8MB,CDCOnBoot=default
+//     Industrial/ESP32-S3/esp32s3
+//
+// A PARTICAO PRECISA DE DOIS SLOTS DE APP, senao nao existe OTA 0x04: "Huge APP",
+// "Minimal" e todos os "No OTA" tem um slot so, e gravar com um deles deixa a
+// peca alcancavel apenas por cabo. O padrao da IDE ("Default 4MB with spiffs")
+// tem os dois slots e roda em qualquer flash >= 4MB, mas sao 1,2MB por slot e o
+// binario ja ocupa ~90% disso - a proxima funcionalidade para de caber.
 // ============================================================================
-
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WebSocketsClient.h>
@@ -93,41 +151,29 @@
 #include <esp_task_wdt.h>
 
 #define FW_VERSION "1.3.0"   // reportado no 0x03 para auditoria da frota
-#define FW_CHIP    "esp32c3" // identifica o chip na telemetria / seleção de OTA
+#define FW_CHIP    "esp32s3" // identifica o chip na telemetria / seleção de OTA
 
-// ---------- Potência de transmissão do rádio ----------
-// Configurável POR PEÇA no /admin e persistida na NVS (chave "txpower", em
-// quartos de dBm — a unidade do próprio enum wifi_power_t).
-// PADRÃO: 19,5 dBm, o máximo do core, que é o comportamento de fábrica.
+// ---------- Potencia de transmissao do radio ----------
+// Configuravel POR PECA no /admin e persistida na NVS (chave "txpower", em
+// quartos de dBm - a unidade do proprio enum wifi_power_t).
+// PADRAO DESTA PLACA: 19,5 dBm, o maximo do core.
 //
-// Por que é configurável: o lote de placas do segundo fornecedor não sustenta os
-// picos de corrente do TX em potência cheia — o 3V3 afunda, a transmissão sai
-// corrompida e a peça não associa em rede nenhuma nem emite beacon do AP, embora
-// a recepção fique perfeita. A 15 dBm essas peças conectam normalmente
-// (docs/LAUDO-LOTE-ESP32C3.md).
+// No C3 esta opcao nasceu como remedio, nao como ajuste: o lote ruim nao emitia
+// nem o beacon do proprio AP em potencia cheia, entao la a peca virgem tinha de
+// NASCER em 15 dBm, senao era impossivel configura-la (docs/LAUDO-LOTE-ESP32C3.md).
+// Aqui nao existe esse fail-safe, de proposito: a migracao para o S3 e a saida
+// daquele hardware, e nascer rebaixada custaria alcance de subida em toda a frota
+// para resolver um problema que esta placa nao tem.
 //
-// A escolha NÃO é automática, de propósito. A falha dessas placas é intermitente
-// e depende de temperatura e carga: um teste no boot passaria numa unidade
-// marginal, ela ficaria travada em 19,5 dBm e cairia horas depois. Quem
-// identifica a peça ruim é o teste de bancada do laudo; aqui só se aplica a
-// decisão já tomada.
+// O controle continua existindo para o caso oposto - instalacao alimentada por
+// fonte ou cabo USB ruim, onde o pico do TX afunda o 3V3. O sintoma que justifica
+// reduzir e o do laudo, e so ele: a peca associa a 15 dBm e falha a 19,5.
 //
-// Há DOIS padrões diferentes, de propósito:
-//
-//  - Peça sem nada salvo na NVS nasce em 15 dBm (TXPOWER_BOOT_Q). É fail-safe:
-//    placa do lote ruim a 19,5 dBm não emite nem o beacon do próprio AP, então
-//    nascer em potência cheia deixaria a peça impossível de configurar. Em 15
-//    dBm o AP aparece em qualquer placa e sempre dá para rodar o wizard.
-//
-//  - A opção pré-selecionada no wizard e no /admin é 19,5 dBm. Ou seja: quem
-//    passa pela configuração normal sai em potência cheia, e só as unidades
-//    reprovadas no teste de bancada são deliberadamente baixadas para 15.
-//
-// Enum, em quartos de dBm: 19,5=78 · 17=68 · 15=60 · 13=52 · 11=44 · 8,5=34 · 5=20
-const int TXPOWER_MIN_Q  =  8;   // 2 dBm — piso de sanidade
-const int TXPOWER_MAX_Q  = 78;   // 19,5 dBm
-const int TXPOWER_BOOT_Q = 60;   // 15 dBm — fail-safe de peça virgem
-wifi_power_t txPower = (wifi_power_t)TXPOWER_BOOT_Q;   // alvo configurado
+// Enum, em quartos de dBm: 19,5=78 - 17=68 - 15=60 - 13=52 - 11=44 - 8,5=34 - 5=20
+const int TXPOWER_MIN_Q     =  8;   // 2 dBm - piso de sanidade
+const int TXPOWER_MAX_Q     = 78;   // 19,5 dBm - padrao
+const int TXPOWER_REDUCED_Q = 60;   // 15 dBm - o degrau do fallback automatico
+wifi_power_t txPower = (wifi_power_t)TXPOWER_MAX_Q;   // alvo configurado
 
 // Fallback automático de potência. Depois de falha sustentada de conexão, a peça
 // passa a tentar o OUTRO nível — e fica no que funcionar. Cobre os dois sentidos:
@@ -141,8 +187,8 @@ wifi_power_t txPower = (wifi_power_t)TXPOWER_BOOT_Q;   // alvo configurado
 bool txPowerFallback = false;
 wifi_power_t activeTxPower() {
   if (!txPowerFallback) return txPower;
-  return (txPower > (wifi_power_t)TXPOWER_BOOT_Q) ? (wifi_power_t)TXPOWER_BOOT_Q
-                                                  : (wifi_power_t)TXPOWER_MAX_Q;
+  return (txPower > (wifi_power_t)TXPOWER_REDUCED_Q) ? (wifi_power_t)TXPOWER_REDUCED_Q
+                                                     : (wifi_power_t)TXPOWER_MAX_Q;
 }
 
 // ---------- Reafirmação da potência ----------
@@ -198,10 +244,69 @@ WebServer server(80);
 WebSocketsClient webSocket;
 Preferences prefs;
 
-// ---------- IO (pinos configuráveis via /config, persistidos na NVS) ----------
-int ledPin   = 8;   // LED azul integrado do Super Mini — ATIVO LOW (fixo)
-int startPin = 4;   // pulso START IN (Speed Queen H3-7), ativo HIGH
-int availPin = 2;   // leitura AVAIL OUT (Speed Queen H3-4), INPUT_PULLUP
+// ---------- IO (pinos configuraveis no /admin, persistidos na NVS) ----------
+int startPin = 5;   // pulso START IN (Speed Queen H3-7), ativo HIGH
+int availPin = 6;   // leitura AVAIL OUT (Speed Queen H3-4), INPUT_PULLUP
+
+// ---------- LED de status ----------
+// O DevKit S3 N16R8 nao tem LED monocromatico de usuario - o unico LED
+// controlavel e um WS2812 enderecavel, que a maioria das placas traz no GPIO48
+// (algumas revisoes usam o 38). Por isso o pino E o modo sao configuraveis: a
+// mesma imagem serve para a placa com RGB, para a com LED comum e para quem
+// soldou um LED externo no painel.
+enum LedMode : uint8_t { LED_MODE_OFF = 0, LED_MODE_HIGH = 1, LED_MODE_LOW = 2, LED_MODE_RGB = 3 };
+int     ledPin  = 48;
+uint8_t ledMode = LED_MODE_RGB;
+
+// GPIOs que este chip/placa nao permite usar. Vale como guarda do /save: um erro
+// de digitacao no pino do START IN e o tipo de coisa que so aparece quando a peca
+// nao da mais boot - e ai exige alguem no local com cabo, nao um OTA.
+//
+//   22..25 : nao existem no ESP32-S3
+//   26..32 : barramento da flash SPI embutida
+//   33..37 : barramento da PSRAM octal. So a variante R8 usa esses pinos - na R2 a
+//            PSRAM e quad e divide o barramento da flash, entao la eles estariam
+//            livres. Ficam bloqueados nas duas assim mesmo: a mesma imagem roda na
+//            frota inteira, e um pino que funciona na N8R2 e mata a N16R8 custa
+//            muito mais caro do que um pino a menos na lista. Vale tambem com a
+//            PSRAM desativada no build - o que manda e a trilha na placa.
+//   19, 20 : USB D-/D+ da porta nativa
+//
+// 0/3/45/46 (strapping) e 43/44 (UART0) sao aceitos: dao trabalho, mas ha casos
+// legitimos de uso e recusa-los engessaria a instalacao sem necessidade.
+bool gpioLivre(int p) {
+  if (p < 0 || p > 48)    return false;
+  if (p >= 22 && p <= 37) return false;
+  if (p == 19 || p == 20) return false;
+  return true;
+}
+
+// Ultimo estado desenhado, para nao reescrever o LED a cada volta do loop: o
+// WS2812 e bit-bang com interrupcoes desabilitadas (~30us por atualizacao), e
+// repetir isso milhares de vezes por segundo e desperdicio puro.
+int lastLedState = -1;
+
+void ledSetup() {
+  lastLedState = -1;
+  if (ledMode == LED_MODE_HIGH || ledMode == LED_MODE_LOW) {
+    pinMode(ledPin, OUTPUT);
+    digitalWrite(ledPin, ledMode == LED_MODE_LOW ? HIGH : LOW);   // comeca apagado
+  }
+}
+
+// Verde = WebSocket conectado | vermelho = sem WebSocket. O brilho e baixo de
+// proposito: o WS2812 no maximo consome ~60mA e ofusca dentro da caixa.
+void ledShow(bool on) {
+  int st = on ? 1 : 0;
+  if (st == lastLedState) return;
+  lastLedState = st;
+  switch (ledMode) {
+    case LED_MODE_RGB:  rgbLedWrite(ledPin, on ? 0 : 12, on ? 12 : 0, 0); break;
+    case LED_MODE_HIGH: digitalWrite(ledPin, on ? HIGH : LOW);            break;
+    case LED_MODE_LOW:  digitalWrite(ledPin, on ? LOW  : HIGH);           break;
+    default: break;   // LED_MODE_OFF: nada a fazer
+  }
+}
 
 // ---------- Pulso START IN ----------
 const uint16_t PULSE_MS = 100;
@@ -677,18 +782,19 @@ void loadPrefs() {
   availPin         = prefs.getInt("availPin", availPin);
   availEnabled     = (prefs.getInt("availEn", 0) != 0);
   wifiChannelHint  = prefs.getInt("wifich", 0);
-  // 0 = chave ausente (nenhum valor válido é 0). Peça nunca configurada fica no
-  // fail-safe de 15 dBm, garantindo que o AP suba em qualquer placa.
-  // Sem chave gravada (0), o padrão depende de a peça já estar instalada ou não:
-  //  - SEM WiFi salvo  → peça virgem/bancada → 15 dBm, para o AP subir em qualquer
-  //    placa e ela poder ser configurada.
-  //  - COM WiFi salvo  → peça em produção que veio de um OTA → 19,5 dBm, que é o
-  //    que ela já usava. Rebaixá-la por causa de um fail-safe pensado para peça
-  //    nova derrubaria instalações que funcionavam.
+  ledPin           = prefs.getInt("ledPin",  ledPin);
+  ledMode          = (uint8_t)constrain(prefs.getInt("ledMode", ledMode), 0, 3);
+  // 0 = chave ausente (nenhum valor valido e 0) -> potencia cheia, o padrao desta
+  // placa. So opera reduzido quem salvou um valor menor pelo /admin.
   int txq          = prefs.getInt("txpower", 0);
   txPower          = (wifi_power_t)(txq ? constrain(txq, TXPOWER_MIN_Q, TXPOWER_MAX_Q)
-                                        : (hasSavedWiFi() ? TXPOWER_MAX_Q : TXPOWER_BOOT_Q));
+                                        : TXPOWER_MAX_Q);
   bootCount        = prefs.getUInt("bootCount",   0);
+  // Pino invalido gravado (placa trocada, digitacao errada num /save antigo) volta
+  // ao padrao em vez de virar peca sem boot.
+  if (!gpioLivre(startPin)) startPin = 5;
+  if (!gpioLivre(availPin)) availPin = 6;
+  if (!gpioLivre(ledPin))   ledPin   = 48;
 }
 
 // ================= AP + STA =================
@@ -1157,6 +1263,14 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT
+  // Serial pela USB nativa. Sem este timeout, cada Serial.print segura o loop por
+  // ate 100ms quando o host enumerou a porta e ninguem esta lendo - que e
+  // exatamente o caso de uma peca alimentada por carregador ou power bank USB.
+  // Zero = escreve o que couber no buffer e segue adiante; log e diagnostico, e
+  // diagnostico nao pode atrasar o controle da maquina.
+  Serial.setTxTimeoutMs(0);
+#endif
   delay(100);
 
   prefs.begin("wifi", false);
@@ -1188,8 +1302,7 @@ void setup() {
                 (unsigned long)((WS_RESTART_TIMEOUT_MS + wsRestartJitterMs) / 60000UL),
                 (unsigned long)(wsRestartJitterMs / 60000UL));
 
-  pinMode(ledPin, OUTPUT);
-  digitalWrite(ledPin, HIGH);  // HIGH = LED apagado (ativo LOW no Super Mini)
+  ledSetup();
   pinMode(startPin, OUTPUT);
   digitalWrite(startPin, LOW);
   pinMode(availPin, INPUT_PULLUP);
@@ -1198,6 +1311,8 @@ void setup() {
   availLastMs     = millis();
   availStableAtMs = millis();
   pulseActive    = false;
+  Serial.printf("Pinos: START=%d AVAIL=%d LED=%d (modo %u)\n",
+                startPin, availPin, ledPin, (unsigned)ledMode);
 
   bootTimeMs            = millis();
   apEnabled             = true;
@@ -1249,8 +1364,7 @@ void loop() {
   otaTick();
   restartTick();
 
-  // GPIO8 LED integrado: ativo LOW (inverso do ESP32-S3)
-  digitalWrite(ledPin, isWebSocketConnected ? LOW : HIGH);
+  ledShow(isWebSocketConnected);
 }
 
 // ================= TICKS =================
@@ -1509,7 +1623,7 @@ a.card:hover{border-color:var(--ac);box-shadow:0 0 0 3px rgba(0,230,118,.1)}
 .foot{margin-top:6px;text-align:center;font-size:11px}
 .foot a{color:var(--mu);text-decoration:none}.foot a:hover{color:var(--ac)}
 </style></head><body>
-<header><div class="logo">FOREASY</div><div class="sub">esp32-c3 · configuração</div></header>
+<header><div class="logo">FOREASY</div><div class="sub">esp32-s3 · configuração</div></header>
 <main>
   <a class="card" href="/wizard"><div class="ct">▶ Assistente (Wizard)</div><div class="cd">Configuração guiada passo a passo: testa o Wi-Fi e o servidor antes de salvar. Recomendado na primeira instalação.</div></a>
   <a class="card" href="/admin"><div class="ct">⚙ Administrador</div><div class="cd">Editar configurações pontuais (Node ID, servidor, redes, pinos) sem refazer tudo.</div></a>
@@ -1574,7 +1688,7 @@ select option{background:var(--cd)}
 .ts{margin-top:9px;font-size:11px;line-height:1.5;min-height:14px;color:var(--mu)}
 .ts.ok{color:var(--ac)}.ts.err{color:var(--red)}.ts.run{color:var(--lb)}
 </style></head><body>
-<header><div class="logo">FOREASY</div><div class="sub">assistente de configuração · esp32-c3</div></header>
+<header><div class="logo">FOREASY</div><div class="sub">assistente de configuração · esp32-s3</div></header>
 <main>
   <div class="steps">
     <div class="pill cur" id="pill0"><b>1</b><span>Rede 1</span></div>
@@ -1625,14 +1739,14 @@ select option{background:var(--cd)}
       <select id="txpower">
         <option value="78">19,5 dBm — máximo (padrão)</option>
         <option value="68">17 dBm</option>
-        <option value="60">15 dBm — placa reprovada no teste de bancada</option>
+        <option value="60">15 dBm — alimentação fraca</option>
         <option value="52">13 dBm</option>
         <option value="44">11 dBm</option>
         <option value="34">8,5 dBm</option>
       </select>
-      <div class="hint">Até salvar, a peça opera em <b>15 dBm</b> para garantir que o AP apareça em qualquer placa. Só reduza de forma permanente se esta unidade <b>falhou a 19,5 e passou a 15</b> no teste de bancada.</div>
+      <div class="hint">Esta placa opera em <b>potência cheia</b> por padrão. Só reduza se a peça <b>associar a 15 dBm e falhar a 19,5</b> — sintoma de fonte ou cabo USB que não sustenta o pico do transmissor.</div>
       <div class="hint">Reinício automático após 15min sem WebSocket: <b>sempre ativo</b>.</div>
-      <div class="hint"><b>Modelos sem AVAIL: deixe o fail-safe desmarcado.</b> Os pinos (START IN / AVAIL OUT) usam os padrões e só são ajustados no Administrador.</div>
+      <div class="hint"><b>Modelos sem AVAIL: deixe o fail-safe desmarcado.</b> Os pinos (START IN <b>GPIO5</b> / AVAIL OUT <b>GPIO6</b>) e o LED de status usam os padrões desta placa e só são ajustados no Administrador.</div>
     </div>
   </div>
 
@@ -1736,8 +1850,7 @@ window.onload=()=>{
     qs('ssid2').value=d.ssid2||''; qs('pass2').value=d.pass2||'';
     qs('nodeid').value=d.nodeid||'';
     qs('availEn').checked=(d.availEn===1);
-    // txpower 0 = nunca configurado: deixa 19,5 pre-selecionado, mesmo com a
-    // peca rodando no fail-safe de 15 ate alguem salvar.
+    // txpower 0 = nunca configurado: 19,5 e o padrao real desta placa.
     qs('txpower').value = d.txpower ? String(d.txpower) : '78';
   }).catch(()=>{});
   scan();
@@ -1788,7 +1901,7 @@ select option{background:var(--cd)}
 .foot{margin-top:16px;text-align:center;font-size:11px}
 .foot a{color:var(--mu);text-decoration:none}.foot a:hover{color:var(--ac)}
 </style></head><body>
-<header><div class="logo">FOREASY</div><div class="sub">administrador · esp32-c3</div></header>
+<header><div class="logo">FOREASY</div><div class="sub">administrador · esp32-s3</div></header>
 <main>
   <div class="box">
     <div class="sec">Node ID</div>
@@ -1817,10 +1930,24 @@ select option{background:var(--cd)}
   </div>
   <div class="box">
     <div class="sec">Pinos — Industrial</div>
-    <label>GPIO START IN</label><input id="startPin" type="number" min="0" max="21">
-    <label>GPIO AVAIL OUT</label><input id="availPin" type="number" min="0" max="21">
+    <label>GPIO START IN</label><input id="startPin" type="number" min="0" max="48">
+    <label>GPIO AVAIL OUT</label><input id="availPin" type="number" min="0" max="48">
     <div class="chk"><input id="availEn" type="checkbox"><label for="availEn">Fail-safe AVAIL</label></div>
+    <div style="color:var(--mu);font-size:10px;line-height:1.5;margin-top:8px">Livres nesta placa: <b>0–18, 21 e 38–48</b>. A peça recusa 19/20 (USB) e 22–37 (flash/PSRAM). Evite 0, 3, 45 e 46 (strapping de boot) e 43/44 (serial).</div>
     <button class="btn" id="bPin">Salvar pinos</button>
+  </div>
+  <div class="box">
+    <div class="sec">LED de status</div>
+    <label>GPIO do LED</label><input id="ledPin" type="number" min="0" max="48">
+    <label>Tipo</label>
+    <select id="ledMode">
+      <option value="3">RGB WS2812 embutido (padrão)</option>
+      <option value="1">LED comum — ativo HIGH</option>
+      <option value="2">LED comum — ativo LOW</option>
+      <option value="0">Desligado</option>
+    </select>
+    <div style="color:var(--mu);font-size:10px;line-height:1.5;margin-top:8px">Verde = WebSocket conectado, vermelho = sem conexão. O DevKit traz o RGB no <b>GPIO48</b>; algumas revisões usam o <b>38</b>.</div>
+    <button class="btn" id="bLed">Salvar LED</button>
   </div>
   <div class="box">
     <div class="sec">Avançado</div>
@@ -1828,12 +1955,12 @@ select option{background:var(--cd)}
     <select id="txpower">
       <option value="78">19,5 dBm — máximo (padrão)</option>
       <option value="68">17 dBm</option>
-      <option value="60">15 dBm — placas com alimentação fraca</option>
+      <option value="60">15 dBm — alimentação fraca</option>
       <option value="52">13 dBm</option>
       <option value="44">11 dBm</option>
       <option value="34">8,5 dBm</option>
     </select>
-    <div style="color:var(--mu);font-size:10px;line-height:1.5;margin:8px 0 0">Peça nunca configurada opera em <b>15 dBm</b> (garante que o AP apareça em qualquer placa) e mostra 19,5 aqui até você salvar. Só reduza de forma permanente em unidade <b>reprovada no teste de bancada</b> — associa a 15 dBm e falha a 19,5. Reduzir encurta o alcance de subida em ~4,5 dB sem alterar o RSSI, que mede a descida.</div>
+    <div style="color:var(--mu);font-size:10px;line-height:1.5;margin:8px 0 0">Esta placa opera em <b>19,5 dBm</b> (potência cheia) por padrão — diferente do C3, cujo lote ruim exigia nascer em 15. Só reduza onde a alimentação não sustenta o pico do transmissor: o sintoma é a peça <b>associar a 15 dBm e falhar a 19,5</b>. Reduzir encurta o alcance de subida em ~4,5 dB sem alterar o RSSI, que mede a descida.</div>
     <button class="btn" id="bAdv">Salvar potência</button>
     <div style="color:var(--mu);font-size:10px;line-height:1.5;margin:10px 0">Auto-restart após 15min sem WebSocket: <b>sempre ativo</b> (não é mais configurável).</div>
     <div class="row"><button class="btn ghost" id="bRst">Reiniciar</button><button class="btn danger" id="bClr">Apagar tudo</button></div>
@@ -1851,8 +1978,9 @@ function scan(){fetch('/scan').then(r=>r.json()).then(l=>{['ssid','ssid2'].forEa
 window.onload=()=>{
   fetch('/config-data').then(r=>r.json()).then(d=>{
     qs('nodeid').value=d.nodeid||''; qs('host').value=d.host||''; qs('port').value=d.port||80;
-    qs('startPin').value=d.startPin!=null?d.startPin:4; qs('availPin').value=d.availPin!=null?d.availPin:2;
+    qs('startPin').value=d.startPin!=null?d.startPin:5; qs('availPin').value=d.availPin!=null?d.availPin:6;
     qs('availEn').checked=(d.availEn===1);
+    qs('ledPin').value=d.ledPin!=null?d.ledPin:48; qs('ledMode').value=String(d.ledMode!=null?d.ledMode:3);
     qs('txpower').value = d.txpower ? String(d.txpower) : '78';   // 0 = nunca configurado
   }).catch(()=>{});
   scan();
@@ -1860,7 +1988,8 @@ window.onload=()=>{
   qs('bSrv').onclick=()=>{if(!val('host')){msg('Preencha o host');return;}save({host:val('host'),port:val('port')||80});};
   qs('bN1').onclick=()=>{let s=val('m1')||val('ssid');if(!s){msg('Escolha a rede 1');return;}save({ssid:s,pass:qs('p1').value});};
   qs('bN2').onclick=()=>{save({ssid2:(val('m2')||val('ssid2')),pass2:qs('p2').value});};
-  qs('bPin').onclick=()=>{save({startPin:val('startPin')||4,availPin:val('availPin')||2,availEn:(qs('availEn').checked?1:0)});};
+  qs('bPin').onclick=()=>{save({startPin:val('startPin')||5,availPin:val('availPin')||6,availEn:(qs('availEn').checked?1:0)});};
+  qs('bLed').onclick=()=>{save({ledPin:val('ledPin')||48,ledMode:qs('ledMode').value});};
   qs('bAdv').onclick=()=>{save({txpower:qs('txpower').value});};
   qs('bRst').onclick=()=>{if(confirm('Reiniciar o dispositivo?')){msg('Reiniciando…');fetch('/restart');}};
   qs('bClr').onclick=()=>{if(confirm('Apagar TODA a configuração e reiniciar?')){msg('Apagando…');fetch('/resetwifi');}};
@@ -1915,6 +2044,8 @@ void handleConfigData() {
   json += "\"startPin\":"    + String(startPin) + ",";
   json += "\"availPin\":"    + String(availPin) + ",";
   json += "\"availEn\":"     + String(availEnabled ? 1 : 0) + ",";
+  json += "\"ledPin\":"      + String(ledPin) + ",";
+  json += "\"ledMode\":"     + String(ledMode) + ",";
   // Valor GRAVADO, não o efetivo: 0 significa "nunca configurado", e é isso que
   // permite às telas pré-selecionarem 19,5 enquanto a peça roda no fail-safe de 15.
   json += "\"txpower\":"     + String(prefs.getInt("txpower", 0));
@@ -1933,8 +2064,27 @@ void handleSave() {
   if (server.hasArg("nodeid"))   { nodeId = server.arg("nodeid"); prefs.putString("nodeid", nodeId); any = true; }
   if (server.hasArg("host"))     { wsHost = server.arg("host");  prefs.putString("wsHost", wsHost); any = true; }
   if (server.hasArg("port"))     { wsPort = (uint16_t)constrain(server.arg("port").toInt(), 1, 65535); prefs.putInt("wsPort", wsPort); any = true; }
-  if (server.hasArg("startPin")) { startPin = constrain(server.arg("startPin").toInt(), 0, 21); prefs.putInt("startPin", startPin); any = true; }
-  if (server.hasArg("availPin")) { availPin = constrain(server.arg("availPin").toInt(), 0, 21); prefs.putInt("availPin", availPin); any = true; }
+  // Pino fora da lista permitida e RECUSADO, nao "aproximado" por constrain: o
+  // GPIO valido mais proximo de um invalido continua sendo o pino errado, e aqui
+  // o engano se paga com uma peca que nao da mais boot - conserto presencial, com
+  // cabo, porque nem OTA tem mais como chegar nela.
+  bool pinoRuim = false;
+  if (server.hasArg("startPin")) {
+    int p = server.arg("startPin").toInt();
+    if (gpioLivre(p)) { startPin = p; prefs.putInt("startPin", p); any = true; }
+    else pinoRuim = true;
+  }
+  if (server.hasArg("availPin")) {
+    int p = server.arg("availPin").toInt();
+    if (gpioLivre(p)) { availPin = p; prefs.putInt("availPin", p); any = true; }
+    else pinoRuim = true;
+  }
+  if (server.hasArg("ledPin")) {
+    int p = server.arg("ledPin").toInt();
+    if (gpioLivre(p)) { ledPin = p; prefs.putInt("ledPin", p); any = true; }
+    else pinoRuim = true;
+  }
+  if (server.hasArg("ledMode")) { ledMode = (uint8_t)constrain(server.arg("ledMode").toInt(), 0, 3); prefs.putInt("ledMode", ledMode); any = true; }
   if (server.hasArg("availEn"))  { availEnabled = server.arg("availEn").toInt() == 1; prefs.putInt("availEn", availEnabled ? 1 : 0); any = true; }
   // txpower em quartos de dBm (unidade do enum wifi_power_t). O constrain evita
   // que um valor absurdo vindo da URL desligue o rádio da peça em campo.
@@ -1945,6 +2095,16 @@ void handleSave() {
 
   if (server.hasArg("ssid") || server.hasArg("ssid2")) wifiSlot = 0;
 
+  // Com pino invalido a peca NAO reinicia, mesmo tendo gravado os outros campos:
+  // reiniciar aqui tiraria a peca do ar em cima de uma configuracao que o
+  // instalador ainda vai corrigir. O que ele salvou de valido ja esta na NVS e
+  // entra em vigor no proximo /save.
+  if (pinoRuim) {
+    server.send(200, "text/plain",
+                "GPIO invalido nesta placa. Livres: 0-18, 21 e 38-48 "
+                "(19/20 = USB, 22-37 = flash/PSRAM).");
+    return;
+  }
   server.send(200, "text/plain", any ? "Configurado. Reiniciando..." : "Nada para salvar.");
   if (any) { delay(400); ESP.restart(); }
 }
@@ -1974,6 +2134,8 @@ void handleStatusJson() {
   json += "\"availLivre\":"   + String(availLivre() ? "true" : "false") + ",";
   json += "\"availSinceMs\":" + String(millis() - availStableAtMs) + ",";
   json += "\"availEn\":"      + String(availEnabled ? 1 : 0) + ",";
+  json += "\"ledPin\":"       + String(ledPin) + ",";
+  json += "\"ledMode\":"      + String(ledMode) + ",";
   json += "\"creditState\":"  + String((int)creditState) + ",";
   json += "\"wifiSlot\":"     + String(wifiSlot) + ",";
   json += "\"rst\":\""        + String(resetReasonStr()) + "\",";
@@ -2013,7 +2175,7 @@ pre{font-size:11px;background:#060a07;color:#4ade80;padding:10px;border-radius:6
 .nav a{color:var(--mu);text-decoration:none;cursor:pointer}.nav a:hover{color:var(--ac)}
 .nav a.danger:hover{color:var(--red)}
 </style></head><body>
-<header><div class="logo">FOREASY</div><div class="sub">esp32-c3 · status — atualiza a cada 2s</div></header>
+<header><div class="logo">FOREASY</div><div class="sub">esp32-s3 · status — atualiza a cada 2s</div></header>
 <main>
   <div class="big">
     <div class="l">AVAIL OUT — status da máquina</div>

@@ -13,7 +13,8 @@ firmware gravado.
 - [5. Protocolo WebSocket](#5-protocolo-websocket)
 - [6. Speed Queen Quantum 440G — conector H3](#6-speed-queen-quantum-440g--conector-h3)
 - [7. Configuração da máquina (MDC)](#7-configuração-da-máquina-mdc)
-- [8. Referências](#8-referências)
+- [8. Gravação (build + upload)](#8-gravação-build--upload)
+- [9. Referências](#9-referências)
 
 ---
 
@@ -34,7 +35,7 @@ firmware gravado.
 ### Industrial
 | MCU | Acionamento | Observações |
 |-----|-------------|-------------|
-| **ESP32-S3** | Cabo direto no START IN (`startPin`) | **Não usa relé — exclusivamente cabo.** AVAIL OUT, detecção de ficha, OTA |
+| **ESP32-S3** N16R8 (DevKit) | Cabo direto no START IN (`startPin`) | **Não usa relé — exclusivamente cabo.** AVAIL OUT, detecção de ficha, OTA. Placa da migração que substitui o C3 do lote ruim |
 | **ESP32-C3** Super Mini | Cabo direto no START IN (`startPin`) | **Não usa relé — exclusivamente cabo.** AVAIL OUT, detecção de ficha, OTA |
 | **ESP8266** ESP-01S (Modelos 1 e 5) | Pulso via relé controlado por **Serial 9600** (STC15F104W) | Modelo 5: relé aciona SSR de alta corrente |
 | **ESP8266** ESP-01S (Modelo 2) | Pulso via relé no **GPIO0** direto | Serial 115200 livre para debug |
@@ -94,8 +95,33 @@ firmware gravado.
   temperatura interna, wizard de 3 passos (Rede → Servidor → Pinos).
 - Diferenças entre placas:
   - **C3**: `ledPin` GPIO8 (LED azul integrado, **ativo LOW**); strapping GPIO2/8/9.
-  - **S3**: `ledPin` GPIO4. ⚠️ o default C++ de `availPin` é 4 (colide com o LED) —
-    definir/salvar o pino correto pelo wizard (fallback do wizard = GPIO6).
+    Potência de TX configurável (NVS `txpower`) e peça virgem nasce em **15 dBm** —
+    fail-safe para o lote de placas do laudo, que a 19,5 dBm não sobe nem o próprio AP.
+  - **S3 (N16R8)**: `esp32s3.ino` é o porte do C3 1.3.0 — mesma lógica, mesmo protocolo,
+    mesmas telas; **corrija bug de lógica nos dois**. Padrões: `startPin` GPIO5,
+    `availPin` GPIO6, `ledPin` GPIO48.
+    - **LED** (`ledMode`, NVS): 0=desligado, 1=comum ativo HIGH, 2=comum ativo LOW,
+      3=**RGB WS2812** (padrão). O DevKit não tem LED monocromático de usuário, só o
+      endereçável — e algumas revisões o trazem no GPIO38 em vez do 48, daí pino e modo
+      serem configuráveis no `/admin`. Verde = WS conectado, vermelho = sem WS.
+    - **`gpioLivre()`** recusa no `/save` os GPIOs 19/20 (USB nativa) e 22–37 (flash SPI
+      + PSRAM octal). Pino errado aí é peça que não dá boot — conserto presencial, nem
+      OTA alcança. Livres: 0–18, 21 e 38–48 (0/3/45/46 strapping e 43/44 UART0 passam,
+      mas evite).
+    - Nasce em **19,5 dBm**: o fail-safe de 15 dBm do C3 não se aplica aqui, e nascer
+      rebaixada custaria alcance de subida sem resolver problema nenhum.
+    - **Build — a flash marcada tem de bater com o chip real.** Estes DevKits são
+      anunciados como N16R8 e chegam **N8R2**; marcar 16MB numa placa de 8MB grava
+      sem erro e a peça entra em pânico em loop no bootloader (`Detected size(8192k)
+      smaller than the size in the binary image header`). Confira com
+      `esptool --port <COM> flash-id`.
+      - **N8R2** (em uso): Flash `8MB` + `8M with spiffs (3MB APP/1.5MB SPIFFS)`
+      - **N16R8**: Flash `16MB` + `16M Flash (3MB APP/9.9MB FATFS)`
+      - PSRAM Disabled nas duas. A partição precisa de **dois slots de app** ou não há
+        OTA `0x04` — `huge_app`, `minimal` e os `no_ota*` têm um só.
+    - `Serial.setTxTimeoutMs(0)` sob `ARDUINO_USB_CDC_ON_BOOT`: com a USB nativa
+      enumerada e ninguém lendo — peça ligada num carregador — cada `print` seguraria
+      o loop.
 
 ### ESP8266 — `industrial_serial` (Modelos 1 e 5)
 - Pulso via relé acionado por **Serial 9600** → STC15F104W:
@@ -207,7 +233,58 @@ GND      ── H3-5 (AVAIL EMIT) + H3-2 (COM)
 
 ---
 
-## 8. Referências
+## 8. Gravação (build + upload)
+
+Não há `arduino-cli` no PATH; use o binário que vem na Arduino IDE:
+`C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe`
+
+Compila e grava em um comando só (`-u -p <PORTA>`; sem isso, apenas compila).
+**Prefira a linha de comando à IDE**: as opções vão no próprio FQBN, então não é
+preciso ficar alternando os menus de Tools a cada modelo de peça — que é como se
+grava a imagem errada na placa errada.
+
+| Firmware | FQBN |
+|---|---|
+| Industrial ESP32-C3 | `esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=min_spiffs` |
+| Industrial ESP32-S3 **N8R2** | `esp32:esp32:esp32s3:FlashSize=8M,PartitionScheme=default_8MB,CDCOnBoot=default` |
+| Industrial ESP32-S3 **N16R8** | `esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=default` |
+| ESP-01S (industrial e convencional) | `esp8266:esp8266:generic:eesz=1M64,baud=115200` |
+
+`arduino-cli board list` mostra a porta. O upload já regrava bootloader e tabela de
+partição, então **trocar de esquema de partição não exige nada além de gravar de
+novo** — e a NVS fica em `0x9000` em todos os esquemas usados aqui, então a
+configuração da peça (nodeId, redes, pinos) sobrevive à troca.
+
+**Três regras que custam uma visita presencial se ignoradas:**
+
+1. **A partição precisa de dois slots de app**, ou não existe OTA `0x04`. `huge_app`,
+   `minimal` e os `no_ota*` têm um só. Referência de ocupação (11/08/2026): C3 1.3.0 =
+   1.287.151 bytes — **65%** em `min_spiffs` (1,9MB×2), mas **98%** no `default` da
+   IDE (1,2MB×2). Daí o C3 ter saído do `default`.
+2. **O Flash Size marcado tem de bater com o chip real** (S3 — ver [§4](#4-específico-de-cada-firmware)).
+3. **"Erase All Flash Before Sketch Upload" desligado.** Ligar apaga a NVS junto.
+   Pelo mesmo motivo, nunca use "Burn Bootloader" para tirar uma peça de loop de
+   reset: não resolve (o upload normal já regrava o bootloader) e apaga a config.
+
+**Alimentação em produção.** As peças são alimentadas por **fonte externa USB** — não
+pelos +5V da máquina (H3-3). No **S3, que tem duas USB-C, use a `COM`**: as duas
+alimentam (mesmo trilho de 5V), mas o conector `USB` liga D+/D− direto nos
+**GPIO19/20 do próprio ESP32-S3**, e fonte USB costuma curto-circuitar D+ com D−
+para sinalizar "sou carregador" — seriam dois pinos do MCU presos a um curto
+externo, permanentemente. No `COM` as linhas de dados terminam no chip da ponte
+USB-UART e o ESP32 só vê o 5V. Com `USB CDC On Boot: Disabled` a porta nativa não
+serve para nada mesmo.
+
+Não é risco iminente: o **C3 Super Mini tem uma única USB-C, e ela é a nativa** — a
+frota de C3 roda nessa condição e funciona. É preferir o caminho isolado onde há
+escolha. Efeito colateral do `COM`: a ponte fica energizada e é ela que comanda o
+auto-reset (EN/GPIO0); sem host USB as linhas ficam em repouso e o boot é normal,
+mas se aparecer **reset esporádico só nas peças S3**, olhe aí primeiro (clones de
+CH340 podem dar glitch no DTR ao energizar).
+
+---
+
+## 9. Referências
 
 - ALPM-39201 — manual elétrico (Alliance Laundry Systems)
 - 204370ENR1 — manual de programação Quantum (jan/2019)
