@@ -907,7 +907,7 @@ function next(){msg('');if(cur===N-1)return save();cur++;paint();}
 function back(){if(cur>0){cur--;paint();msg('');}}
 function save(){var ss=qs('manual_ssid').value.trim()||qs('ssid').value;var ss2=qs('ssid2').value.trim();
   if(!qs('nodeid').value.trim()){msg('Preencha o Node ID');return;}msg('Salvando…');
-  var b='ssid='+encodeURIComponent(ss)+'&pass='+encodeURIComponent(qs('pass').value)+'&ssid2='+encodeURIComponent(ss2)+'&pass2='+encodeURIComponent(qs('pass2').value)+'&nodeid='+encodeURIComponent(qs('nodeid').value.trim())+'&invert='+(qs('invert').checked?1:0)+'&wsrestart='+(qs('wsrestart').checked?1:0);
+  var b='ssid='+encodeURIComponent(ss)+'&pass='+encodeURIComponent(qs('pass').value)+'&ssid2='+encodeURIComponent(ss2)+'&pass2='+encodeURIComponent(qs('pass2').value)+'&nodeid='+encodeURIComponent(qs('nodeid').value.trim())+'&invert='+(qs('invert').checked?1:0)+'&wsrestart='+(qs('wsrestart').checked?1:0)+'&wizard=1';
   fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b}).then(function(r){return r.text();}).then(function(t){msg(t+' Reconecte ao Wi-Fi em ~5s.');}).catch(function(){msg('Falha ao salvar.');});}
 function encText(e){return['Open','WEP','WPA-PSK','WPA2-PSK','WPA/WPA2'][e]||'?';}
 function scan(retry){retry=retry||0;fetch('/scan').then(function(r){return r.json();}).then(function(list){if(list.length===0&&retry<6){setTimeout(function(){scan(retry+1);},2500);return;}scanList=list;var s=qs('ssid');s.innerHTML='';list.forEach(function(i){var o=document.createElement('option');o.value=i.ssid;o.textContent=i.ssid+' · '+i.rssi+'dBm · ch'+i.channel+' · '+encText(i.enc);s.appendChild(o);});}).catch(function(){if(retry<6)setTimeout(function(){scan(retry+1);},2500);});}
@@ -1259,6 +1259,10 @@ static void handleSave() {
   if (server.hasArg("port"))      { long pt = server.arg("port").toInt(); P.wsPort = (uint16_t)((pt < 1 || pt > 65535) ? WS_PORT : pt); any = true; }
   if (server.hasArg("invert"))    { P.relayInvert      = server.arg("invert").toInt()    ? 1 : 0; any = true; }
   if (server.hasArg("wsrestart")) { P.wsRestartEnabled = server.arg("wsrestart").toInt() ? 1 : 0; any = true; }
+  // "wizard=1" só vem do passo final do assistente (não do /admin). Zera o
+  // contador ali para a fidelidade da telemetria: reinícios do bench/teste
+  // durante a configuração não devem aparecer como reinícios em campo.
+  if (server.hasArg("wizard"))    { P.bootCount = 0; any = true; }
 
   if (!any) { server.send(200, "text/plain", "Nada para salvar."); return; }
 

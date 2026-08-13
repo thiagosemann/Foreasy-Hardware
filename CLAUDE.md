@@ -72,6 +72,9 @@ firmware gravado.
 - **Páginas web**: `/config` (wizard) e `/info` (status com auto-refresh); `/` → `/config`.
 - **Protocolo WS**: telemetria `0x03` e restart remoto `0x06` em todos (ver [§5](#5-protocolo-websocket)).
 - **`bootCount`** incrementado em RAM, gravado só no `/save` (poupa flash/EEPROM).
+  Zerado quando o `/save` vem do passo final do wizard (`wizard=1` — no Midea,
+  único save do firmware, sempre zera): reinícios do bench/teste durante a
+  configuração não devem contar como reinícios em campo.
 - **Identidade de firmware** no `0x03`: `chip` (`esp8266`/`esp32`/`esp32s3`/`esp32c3`)
   e `fw` (semver, ex. `1.0.0`) — para auditoria da frota e seleção do binário de OTA.
 

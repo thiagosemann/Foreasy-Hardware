@@ -944,7 +944,7 @@ function next(){msg('');if(cur===N-1)return save();cur++;paint();}
 function back(){if(cur>0){cur--;paint();msg('');}}
 function save(){var ss=qs('manual_ssid').value.trim()||qs('ssid').value;var ss2=qs('ssid2').value.trim()||qs('ssid2_scan').value;
   if(!qs('nodeid').value.trim()){msg('Preencha o Node ID');return;}msg('Salvando…');
-  var b='ssid='+encodeURIComponent(ss)+'&pass='+encodeURIComponent(qs('pass').value)+'&ssid2='+encodeURIComponent(ss2)+'&pass2='+encodeURIComponent(qs('pass2').value)+'&nodeid='+encodeURIComponent(qs('nodeid').value.trim())+'&relayMode='+relayModeVal+'&relayInvert='+(qs('invert').checked?1:0);
+  var b='ssid='+encodeURIComponent(ss)+'&pass='+encodeURIComponent(qs('pass').value)+'&ssid2='+encodeURIComponent(ss2)+'&pass2='+encodeURIComponent(qs('pass2').value)+'&nodeid='+encodeURIComponent(qs('nodeid').value.trim())+'&relayMode='+relayModeVal+'&relayInvert='+(qs('invert').checked?1:0)+'&wizard=1';
   fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b}).then(function(r){return r.text();}).then(function(t){msg(t+' Reconecte ao Wi-Fi em ~5s.');}).catch(function(){msg('Falha ao salvar.');});}
 function scan(retry){retry=retry||0;fetch('/scan').then(function(r){return r.json();}).then(function(list){if(list.length===0&&retry<6){setTimeout(function(){scan(retry+1);},2500);return;}scanList=list;
   var s=qs('ssid');s.innerHTML='';var s2=qs('ssid2_scan');s2.innerHTML='<option value="">— nenhuma —</option>';
@@ -1346,6 +1346,10 @@ static void handleSave() {
   if (server.hasArg("relayMode"))   { long m = server.arg("relayMode").toInt(); P.relayMode = (uint8_t)((m < 0 || m > 2) ? 0 : m); any = true; }
   if (server.hasArg("relayInvert")) { P.relayInvert      = server.arg("relayInvert").toInt() ? 1 : 0; any = true; }
   if (server.hasArg("wsrestart"))   { P.wsRestartEnabled = server.arg("wsrestart").toInt()   ? 1 : 0; any = true; }
+  // "wizard=1" só vem do passo final do assistente (não do /admin). Zera o
+  // contador ali para a fidelidade da telemetria: reinícios do bench/teste
+  // durante a configuração não devem aparecer como reinícios em campo.
+  if (server.hasArg("wizard"))      { P.bootCount = 0; any = true; }
 
   if (!any) { server.send(200, "text/plain", "Nada para salvar."); return; }
 

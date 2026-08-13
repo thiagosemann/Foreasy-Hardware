@@ -705,6 +705,10 @@ void handleSave() {
   prefs.putString("mdToken", mideaTokenHex);
   prefs.putString("mdKey",   mideaKeyHex);
   prefs.putInt("mdType",     mideaType);
+  // Única tela de configuração deste firmware (sem /admin separado): todo
+  // /save é fim de wizard. Zera o contador para a fidelidade da telemetria —
+  // reinícios do bench/teste não devem aparecer como reinícios em campo.
+  bootCount = 0;
   prefs.putUInt("bootCount", bootCount);
 
   server.send(200, "text/plain", "Configurado. Reiniciando...");

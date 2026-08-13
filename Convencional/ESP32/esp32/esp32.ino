@@ -996,7 +996,8 @@ function save(){
     '&pass2='+encodeURIComponent(qs('pass2').value)+
     '&nodeid='+encodeURIComponent(qs('nodeid').value.trim())+
     '&relayMode='+relayModeVal+
-    '&relayInvert='+(qs('invert').checked?1:0);
+    '&relayInvert='+(qs('invert').checked?1:0)+
+    '&wizard=1';
   fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b})
     .then(r=>r.text()).then(t=>{msg(t+' Reconecte ao Wi-Fi em ~5s.');})
     .catch(()=>msg('Falha ao salvar.'));
@@ -1223,6 +1224,10 @@ void handleSave() {
   if (server.hasArg("wsrestart"))  { wsRestartEnabled = server.arg("wsrestart").toInt() == 1; prefs.putInt("wsrestart", wsRestartEnabled ? 1 : 0); any = true; }
 
   if (server.hasArg("ssid") || server.hasArg("ssid2")) wifiSlot = 0;
+  // "wizard=1" só vem do passo final do assistente (não do /admin). Zera o
+  // contador ali para a fidelidade da telemetria: reinícios do bench/teste
+  // durante a configuração não devem aparecer como reinícios em campo.
+  if (server.hasArg("wizard")) { bootCount = 0; any = true; }
   prefs.putUInt("bootCount", bootCount);
   if (relayChanged) { updateRelayLevels(); applyRelayOutput(); }
 

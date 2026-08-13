@@ -1710,7 +1710,8 @@ function save(){
     '&pass2='+encodeURIComponent(qs('pass2').value)+
     '&nodeid='+encodeURIComponent(qs('nodeid').value.trim())+
     '&availEn='+(qs('availEn').checked?1:0)+
-    '&txpower='+qs('txpower').value;
+    '&txpower='+qs('txpower').value+
+    '&wizard=1';
   fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b})
     .then(r=>r.text()).then(t=>{msg(t+' Reconecte ao Wi-Fi em ~5s.');})
     .catch(()=>msg('Falha ao salvar.'));
@@ -1944,6 +1945,11 @@ void handleSave() {
   // precisam ser mexidas — inclusive as que tinham o valor salvo como 0.
 
   if (server.hasArg("ssid") || server.hasArg("ssid2")) wifiSlot = 0;
+
+  // "wizard=1" só vem do passo final do assistente (não do /admin). Zera o
+  // contador ali para a fidelidade da telemetria: reinícios do bench/teste
+  // durante a configuração não devem aparecer como reinícios em campo.
+  if (server.hasArg("wizard")) { bootCount = 0; prefs.putUInt("bootCount", bootCount); any = true; }
 
   server.send(200, "text/plain", any ? "Configurado. Reiniciando..." : "Nada para salvar.");
   if (any) { delay(400); ESP.restart(); }
