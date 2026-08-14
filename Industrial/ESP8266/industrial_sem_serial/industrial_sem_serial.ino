@@ -78,7 +78,7 @@ static const char*    WS_HOST = "frst-back-02b607761078.herokuapp.com";
 static const uint16_t WS_PORT = 80;
 
 // Identidade do firmware (reportada no WS 0x03 — auditoria da frota / seleção de OTA)
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.4.0"
 #define FW_CHIP    "esp8266"   // ESP-01S (Modelo 2)
 
 // ======================== IO (ESP-01/ESP-01S / Generic ESP8266) =========================
@@ -1295,21 +1295,39 @@ static void handleSave() {
 
 static void handleNotFound() { server.send(404, "text/plain", "Not found"); }
 
+// ================= AUTENTICAÇÃO DO PAINEL =================
+// HTTP Basic Auth (popup nativo do navegador) em vez de página HTML própria —
+// no ESP8266 o custo de RAM/flash da tela de login + cookie de sessão não
+// compensa (o painel roda no ESP32-C3/S3 com HTML bonito; aqui fica o popup
+// mesmo). Senha de fábrica fixa no firmware, de propósito: sem tela de
+// "trocar senha" — perder a senha numa peça em campo, sem cabo USB para
+// recuperar, é pior do que a senha ser sempre a mesma de fábrica.
+const char* PANEL_USER = "admin";
+const char* PANEL_PASS = "Foreasy@12345678";
+
+bool checkAuth() {
+  if (!server.authenticate(PANEL_USER, PANEL_PASS)) {
+    server.requestAuthentication();
+    return false;
+  }
+  return true;
+}
+
 static void startWebServer() {
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/wizard", HTTP_GET, handleConfigPage);
-  server.on("/config", HTTP_GET, handleConfigPage);
-  server.on("/admin", HTTP_GET, handleAdminPage);
-  server.on("/config-data", HTTP_GET, handleConfigData);
-  server.on("/info", HTTP_GET, handleInfoPage);
-  server.on("/scan", HTTP_GET, handleScan);
-  server.on("/save", HTTP_POST, handleSave);
-  server.on("/test-wifi", HTTP_GET, handleTestWifi);
-  server.on("/test-wifi-status", HTTP_GET, handleTestWifiStatus);
-  server.on("/test-ws", HTTP_GET, handleTestWs);
-  server.on("/restart", HTTP_GET, handleRestart);
-  server.on("/resetwifi", HTTP_GET, handleResetWifi);
-  server.on("/diagflash", HTTP_GET, handleDiagFlash);
+  server.on("/", HTTP_GET, [](){ if (checkAuth()) handleRoot(); });
+  server.on("/wizard", HTTP_GET, [](){ if (checkAuth()) handleConfigPage(); });
+  server.on("/config", HTTP_GET, [](){ if (checkAuth()) handleConfigPage(); });
+  server.on("/admin", HTTP_GET, [](){ if (checkAuth()) handleAdminPage(); });
+  server.on("/config-data", HTTP_GET, [](){ if (checkAuth()) handleConfigData(); });
+  server.on("/info", HTTP_GET, [](){ if (checkAuth()) handleInfoPage(); });
+  server.on("/scan", HTTP_GET, [](){ if (checkAuth()) handleScan(); });
+  server.on("/save", HTTP_POST, [](){ if (checkAuth()) handleSave(); });
+  server.on("/test-wifi", HTTP_GET, [](){ if (checkAuth()) handleTestWifi(); });
+  server.on("/test-wifi-status", HTTP_GET, [](){ if (checkAuth()) handleTestWifiStatus(); });
+  server.on("/test-ws", HTTP_GET, [](){ if (checkAuth()) handleTestWs(); });
+  server.on("/restart", HTTP_GET, [](){ if (checkAuth()) handleRestart(); });
+  server.on("/resetwifi", HTTP_GET, [](){ if (checkAuth()) handleResetWifi(); });
+  server.on("/diagflash", HTTP_GET, [](){ if (checkAuth()) handleDiagFlash(); });
   server.onNotFound(handleNotFound);
   server.begin();
 }

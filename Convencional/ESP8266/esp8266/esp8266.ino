@@ -83,7 +83,7 @@ static const char*    WS_HOST = "frst-back-02b607761078.herokuapp.com";
 static const uint16_t WS_PORT = 80;
 
 // Identidade do firmware (reportada no WS 0x03 — auditoria da frota)
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.4.0"
 #define FW_CHIP    "esp8266"   // ESP-01S (Modelo 6 — convencional)
 
 // ======================== IO (ESP-01/ESP-01S / Generic ESP8266) =========================
@@ -1565,31 +1565,49 @@ static void handleDiagFlash() {
 
 static void handleNotFound() { server.send(404, "text/plain", "Not found"); }
 
+// ================= AUTENTICAÇÃO DO PAINEL =================
+// HTTP Basic Auth (popup nativo do navegador) em vez de página HTML própria —
+// no ESP8266 o custo de RAM/flash da tela de login + cookie de sessão não
+// compensa (o painel roda no ESP32-C3/S3 com HTML bonito; aqui fica o popup
+// mesmo). Senha de fábrica fixa no firmware, de propósito: sem tela de
+// "trocar senha" — perder a senha numa peça em campo, sem cabo USB para
+// recuperar, é pior do que a senha ser sempre a mesma de fábrica.
+const char* PANEL_USER = "admin";
+const char* PANEL_PASS = "Foreasy@12345678";
+
+bool checkAuth() {
+  if (!server.authenticate(PANEL_USER, PANEL_PASS)) {
+    server.requestAuthentication();
+    return false;
+  }
+  return true;
+}
+
 static void startWebServer() {
-  server.on("/",                 HTTP_GET,  handleRoot);            // landing: Wizard / Administrador
-  server.on("/wizard",           HTTP_GET,  handleConfigPage);      // assistente passo a passo
-  server.on("/config",           HTTP_GET,  handleConfigPage);      // alias (compat)
-  server.on("/admin",            HTTP_GET,  handleAdminPage);       // edições pontuais
-  server.on("/config-data",      HTTP_GET,  handleConfigData);
-  server.on("/info",             HTTP_GET,  handleInfoPage);
-  server.on("/status",           HTTP_GET,  handleStatusJson);
-  server.on("/logs",             HTTP_GET,  handleLogs);
-  server.on("/scan",             HTTP_GET,  handleScan);
-  server.on("/save",             HTTP_POST, handleSave);
-  server.on("/test-wifi",        HTTP_GET,  handleTestWifi);
-  server.on("/test-wifi-status", HTTP_GET,  handleTestWifiStatus);
-  server.on("/test-ws",          HTTP_GET,  handleTestWs);
-  server.on("/relay",            HTTP_GET,  handleRelayPage);
-  server.on("/relay/on",         HTTP_GET,  handleRelayOn);
-  server.on("/relay/off",        HTTP_GET,  handleRelayOff);
-  server.on("/relay/config",     HTTP_POST, handleRelayConfigSave);
-  server.on("/nodeid",           HTTP_GET,  handleNodeIdPage);
-  server.on("/savenodeid",       HTTP_POST, handleSaveNodeId);
-  server.on("/wifistatus",       HTTP_GET,  handleWiFiStatusPage);
-  server.on("/wsstatus",         HTTP_GET,  handleWSStatusPage);
-  server.on("/resetwifi",        HTTP_GET,  handleResetWifi);
-  server.on("/restart",          HTTP_GET,  handleRestart);
-  server.on("/diagflash",        HTTP_GET,  handleDiagFlash);
+  server.on("/",                 HTTP_GET,  [](){ if (checkAuth()) handleRoot(); });            // landing: Wizard / Administrador
+  server.on("/wizard",           HTTP_GET,  [](){ if (checkAuth()) handleConfigPage(); });      // assistente passo a passo
+  server.on("/config",           HTTP_GET,  [](){ if (checkAuth()) handleConfigPage(); });      // alias (compat)
+  server.on("/admin",            HTTP_GET,  [](){ if (checkAuth()) handleAdminPage(); });       // edições pontuais
+  server.on("/config-data",      HTTP_GET,  [](){ if (checkAuth()) handleConfigData(); });
+  server.on("/info",             HTTP_GET,  [](){ if (checkAuth()) handleInfoPage(); });
+  server.on("/status",           HTTP_GET,  [](){ if (checkAuth()) handleStatusJson(); });
+  server.on("/logs",             HTTP_GET,  [](){ if (checkAuth()) handleLogs(); });
+  server.on("/scan",             HTTP_GET,  [](){ if (checkAuth()) handleScan(); });
+  server.on("/save",             HTTP_POST, [](){ if (checkAuth()) handleSave(); });
+  server.on("/test-wifi",        HTTP_GET,  [](){ if (checkAuth()) handleTestWifi(); });
+  server.on("/test-wifi-status", HTTP_GET,  [](){ if (checkAuth()) handleTestWifiStatus(); });
+  server.on("/test-ws",          HTTP_GET,  [](){ if (checkAuth()) handleTestWs(); });
+  server.on("/relay",            HTTP_GET,  [](){ if (checkAuth()) handleRelayPage(); });
+  server.on("/relay/on",         HTTP_GET,  [](){ if (checkAuth()) handleRelayOn(); });
+  server.on("/relay/off",        HTTP_GET,  [](){ if (checkAuth()) handleRelayOff(); });
+  server.on("/relay/config",     HTTP_POST, [](){ if (checkAuth()) handleRelayConfigSave(); });
+  server.on("/nodeid",           HTTP_GET,  [](){ if (checkAuth()) handleNodeIdPage(); });
+  server.on("/savenodeid",       HTTP_POST, [](){ if (checkAuth()) handleSaveNodeId(); });
+  server.on("/wifistatus",       HTTP_GET,  [](){ if (checkAuth()) handleWiFiStatusPage(); });
+  server.on("/wsstatus",         HTTP_GET,  [](){ if (checkAuth()) handleWSStatusPage(); });
+  server.on("/resetwifi",        HTTP_GET,  [](){ if (checkAuth()) handleResetWifi(); });
+  server.on("/restart",          HTTP_GET,  [](){ if (checkAuth()) handleRestart(); });
+  server.on("/diagflash",        HTTP_GET,  [](){ if (checkAuth()) handleDiagFlash(); });
   server.onNotFound(handleNotFound);
   server.begin();
 }

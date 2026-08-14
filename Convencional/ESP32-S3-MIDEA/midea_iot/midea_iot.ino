@@ -35,7 +35,7 @@
 #include <mbedtls/sha256.h>
 #include <mbedtls/md5.h>
 
-#define FW_VERSION "0.3.0"
+#define FW_VERSION "1.4.0"
 #define FW_CHIP    "esp32s3"
 
 // ---------------- LED ----------------
@@ -648,17 +648,127 @@ void handleRestart();
 void handleResetWiFi();
 void handlePower();
 
+// ================= AUTENTICAÇÃO DO PAINEL =================
+// Login com página HTML própria (visual igual ao resto do painel) em vez do
+// popup nativo do navegador (HTTP Basic Auth). Sessão via cookie: um token
+// gerado no boot, guardado só em RAM — reinício da peça derruba a sessão de
+// todo mundo, o que é o comportamento desejado (evita ter que gravar/expirar
+// sessão na NVS). Senha de fábrica fixa no firmware, de propósito: sem tela de
+// "trocar senha" — perder a senha numa peça em campo, sem cabo USB para
+// recuperar, é pior do que a senha ser sempre a mesma de fábrica.
+const char* PANEL_USER = "admin";
+const char* PANEL_PASS = "Foreasy@12345678";
+char sessionToken[17];
+
+// Mistura (xorshift) do ID de fábrica do chip (único por peça) com millis()/
+// micros() (variam por boot). Não é esp_random(): aqui no boot o rádio ainda
+// não subiu e, sem WiFi/BT ativo, o gerador de hardware não é verdadeiramente
+// aleatório.
+void generateSessionToken() {
+  uint64_t seed = ESP.getEfuseMac();
+  seed ^= ((uint64_t)millis() << 16) ^ (uint64_t)micros();
+  const char* hex = "0123456789abcdef";
+  for (int i = 0; i < 16; i++) {
+    seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+    sessionToken[i] = hex[seed & 0xF];
+  }
+  sessionToken[16] = '\0';
+}
+
+bool checkAuth() {
+  if (server.hasHeader("Cookie") &&
+      server.header("Cookie").indexOf(String("session=") + sessionToken) != -1) {
+    return true;
+  }
+  server.sendHeader("Location", "/login");
+  server.send(302, "text/plain", "");
+  return false;
+}
+
+void handleLoginPage() {
+  bool erro = server.hasArg("erro");
+  String html = R"rawliteral(
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Foreasy — Login</title>
+<style>
+:root{--bg:#070b08;--cd:#0f1612;--bd:#1e3028;--ac:#00e676;--tx:#d4f5e0;--mu:#557060;--red:#f87171}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:radial-gradient(120% 80% at 50% -10%,#0d1a13 0%,var(--bg) 60%);color:var(--tx);font-family:ui-monospace,'SF Mono',monospace;font-size:14px;min-height:100vh;display:flex;align-items:center;justify-content:center}
+.box{background:var(--cd);border:1px solid var(--bd);border-radius:10px;padding:32px;width:min(300px,88vw)}
+.logo{color:var(--ac);font-size:22px;font-weight:700;letter-spacing:4px;text-align:center;margin-bottom:4px}
+.sub{color:var(--mu);font-size:10px;letter-spacing:1px;text-transform:uppercase;text-align:center;margin-bottom:22px}
+label{display:block;color:var(--mu);font-size:10px;letter-spacing:1px;text-transform:uppercase;margin-bottom:5px}
+input{width:100%;background:#060a07;border:1px solid var(--bd);border-radius:6px;color:var(--tx);padding:9px 10px;font:inherit;margin-bottom:14px}
+input:focus{outline:none;border-color:var(--ac)}
+.pwrap{position:relative;margin-bottom:14px}
+.pwrap input{margin-bottom:0;padding-right:38px}
+.pwtoggle{position:absolute;right:4px;top:50%;transform:translateY(-50%);width:30px;height:30px;display:flex;align-items:center;justify-content:center;background:none;border:0;padding:0;color:var(--mu);cursor:pointer;font-size:15px;line-height:1}
+.pwtoggle:hover{color:var(--ac)}
+button{width:100%;background:var(--ac);color:#04150b;border:0;border-radius:6px;padding:10px;font:inherit;font-weight:700;cursor:pointer;letter-spacing:1px}
+button:hover{opacity:.9}
+.err{color:var(--red);font-size:11px;text-align:center;margin-bottom:14px}
+</style></head><body>
+<form class="box" method="POST" action="/login">
+  <div class="logo">FOREASY</div>
+  <div class="sub">acesso ao painel</div>
+)rawliteral";
+  if (erro) html += "  <div class=\"err\">usuário ou senha incorretos</div>\n";
+  html += R"rawliteral(  <label>Usuário</label>
+  <input type="text" name="user" autocomplete="username" autofocus>
+  <label>Senha</label>
+  <div class="pwrap">
+    <input type="password" name="pass" id="pass" autocomplete="current-password">
+    <button type="button" class="pwtoggle" id="pwtoggle" tabindex="-1" aria-label="Mostrar senha">&#128065;</button>
+  </div>
+  <button type="submit">Entrar</button>
+</form>
+<script>
+document.getElementById('pwtoggle').onclick=function(){
+  var p=document.getElementById('pass');
+  var show=p.type==='password';
+  p.type=show?'text':'password';
+  this.innerHTML=show?'&#128584;':'&#128065;';
+};
+</script>
+</body></html>
+)rawliteral";
+  server.send(200, "text/html", html);
+}
+
+void handleLoginSubmit() {
+  if (server.arg("user") == PANEL_USER && server.arg("pass") == PANEL_PASS) {
+    server.sendHeader("Set-Cookie", String("session=") + sessionToken + "; Path=/; HttpOnly");
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "");
+  } else {
+    server.sendHeader("Location", "/login?erro=1");
+    server.send(302, "text/plain", "");
+  }
+}
+
+void handleLogout() {
+  server.sendHeader("Set-Cookie", "session=deslogado; Path=/; Max-Age=0");
+  server.sendHeader("Location", "/login");
+  server.send(302, "text/plain", "");
+}
+
 void startWebServer() {
-  server.on("/",            handleRoot);
-  server.on("/config",      handleConfigPage);
-  server.on("/config-data", HTTP_GET,  handleConfigData);
-  server.on("/info",        handleInfoPage);
-  server.on("/status",      HTTP_GET,  handleStatusJson);
-  server.on("/scan",        HTTP_GET,  handleScan);
-  server.on("/save",        HTTP_POST, handleSave);
-  server.on("/power",       HTTP_GET,  handlePower);
-  server.on("/restart",     HTTP_GET,  handleRestart);
-  server.on("/resetwifi",   HTTP_GET,  handleResetWiFi);
+  const char* headerKeys[] = {"Cookie"};
+  server.collectHeaders(headerKeys, 1);
+  server.on("/login",        HTTP_GET,  handleLoginPage);
+  server.on("/login",        HTTP_POST, handleLoginSubmit);
+  server.on("/logout",       HTTP_GET,  handleLogout);
+  server.on("/",            [](){ if (checkAuth()) handleRoot(); });
+  server.on("/config",      [](){ if (checkAuth()) handleConfigPage(); });
+  server.on("/config-data", HTTP_GET,  [](){ if (checkAuth()) handleConfigData(); });
+  server.on("/info",        [](){ if (checkAuth()) handleInfoPage(); });
+  server.on("/status",      HTTP_GET,  [](){ if (checkAuth()) handleStatusJson(); });
+  server.on("/scan",        HTTP_GET,  [](){ if (checkAuth()) handleScan(); });
+  server.on("/save",        HTTP_POST, [](){ if (checkAuth()) handleSave(); });
+  server.on("/power",       HTTP_GET,  [](){ if (checkAuth()) handlePower(); });
+  server.on("/restart",     HTTP_GET,  [](){ if (checkAuth()) handleRestart(); });
+  server.on("/resetwifi",   HTTP_GET,  [](){ if (checkAuth()) handleResetWiFi(); });
   server.onNotFound([](){ server.send(404, "text/plain", "Not found"); });
   server.begin();
 }
@@ -928,7 +1038,7 @@ pre{font-size:11px;background:#060a07;color:#4ade80;padding:10px;border-radius:6
     <div class="it"><div class="lb">Ultimo erro</div><div class="vl" id="err">…</div></div>
     <div class="it"><div class="lb">Boots</div><div class="vl" id="boots">…</div></div>
   </div>
-  <div class="nav"><a href="/config">← configuracao</a><a href="/restart">reiniciar</a></div>
+  <div class="nav"><a href="/config">← configuracao</a><a href="/restart">reiniciar</a><a href="/logout">sair</a></div>
   <pre id="raw"></pre>
 </main>
 <script>
@@ -962,6 +1072,7 @@ fetch('/status').then(r=>r.json()).then(j=>{
 
 void setup() {
   Serial.begin(115200);
+  generateSessionToken();
   delay(100);
 
   pinMode(ledPin, OUTPUT);
