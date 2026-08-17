@@ -557,9 +557,21 @@ static void failoverReconnect() {
 }
 
 // ======================== AP / WiFi / WS =========================
+// Sufixo do chip ID de fábrica (2 bytes, 4 dígitos hex) — diferencia o AP de
+// cada peça quando várias sobem juntas em bancada com o nodeId ainda no
+// padrão (mesmo nodeId = SSID igual em todas, dá erro pra conectar na peça
+// certa). ESP.getChipId() já é derivado do MAC, único por placa e estável
+// entre reinícios — não precisa de RNG (o ESP8266 nem tem gerador de
+// hardware confiável antes do rádio subir).
+static String apSuffix() {
+  char buf[5];
+  snprintf(buf, sizeof(buf), "%04X", (unsigned)(ESP.getChipId() & 0xFFFF));
+  return String(buf);
+}
+
 static void setupAPSTA() {
   char apName[40];
-  snprintf(apName, sizeof(apName), "%s-AP", P.nodeId[0] ? P.nodeId : "FOREASY");
+  snprintf(apName, sizeof(apName), "%s-%s-AP", P.nodeId[0] ? P.nodeId : "FOREASY", apSuffix().c_str());
   const char* apPass = "12345678";
   bool hidden = false;
 
@@ -581,7 +593,11 @@ static void connectToWiFi_begin() {
     log_append_line("Nenhuma credencial Wi-Fi salva.");
     return;
   }
-  WiFi.mode(WIFI_AP_STA);
+  // Só volta para AP_STA se o AP ainda estiver de direito ligado (apEnabled).
+  // Usar AP_STA incondicionalmente aqui religava o rádio do AP em toda
+  // reconexão pós-expiração (softAP mantém a config antiga na memória do
+  // driver), inclusive depois do apLifetimeTick já ter desligado.
+  WiFi.mode(apEnabled ? WIFI_AP_STA : WIFI_STA);
   WiFi.begin(activeSSID(), activePass());
   wifiConnecting = true;
   wifiConnectStartMs = millis();
@@ -729,7 +745,7 @@ static void startWifiTest(const String& ssid, const String& pass, int ch) {
   delay(40);
   if (ch >= 1 && ch <= 13) {
     char apName[40];
-    snprintf(apName, sizeof(apName), "%s-AP", P.nodeId[0] ? P.nodeId : "FOREASY");
+    snprintf(apName, sizeof(apName), "%s-%s-AP", P.nodeId[0] ? P.nodeId : "FOREASY", apSuffix().c_str());
     WiFi.softAP(apName, "12345678", ch, false);
     WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
     delay(60);

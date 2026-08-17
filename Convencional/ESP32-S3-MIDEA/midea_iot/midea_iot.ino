@@ -67,6 +67,21 @@ static const uint8_t MIDEA_BROADCAST[72] = {
 
 // ---------------- Identidade / config ----------------
 String nodeId   = "MIDEA-001";
+
+// Sufixo do MAC de fábrica (2 bytes, 4 dígitos hex) — diferencia o AP de cada
+// peça quando várias sobem juntas em bancada com o nodeId ainda no padrão
+// (mesmo nodeId = SSID igual em todas, dá erro pra conectar na peça certa).
+// Vem do efuse via ESP.getEfuseMac(), não de esp_random(): o rádio ainda não
+// subiu neste ponto do boot, e sem Wi-Fi/BT ativo o gerador não é
+// verdadeiramente aleatório (risco real de a frota inteira sortear o mesmo
+// valor). O MAC é único por placa e estável entre reinícios, o que também
+// mantém o nome do AP igual se precisar reconectar na mesma peça depois de
+// um reboot.
+String apSuffix() {
+  char buf[5];
+  snprintf(buf, sizeof(buf), "%04X", (unsigned)(ESP.getEfuseMac() & 0xFFFF));
+  return String(buf);
+}
 String mideaIdS = "";      // device_id decimal
 uint64_t mideaId = 0;
 String mideaIp  = "";
@@ -589,7 +604,7 @@ void loadPrefs() {
 
 void setupAPSTA() {
   WiFi.mode(WIFI_AP_STA);
-  String apName = nodeId + "-AP";
+  String apName = nodeId + "-" + apSuffix() + "-AP";
   WiFi.softAP(apName.c_str(), "12345678", 1, false);
   delay(200);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
@@ -597,7 +612,11 @@ void setupAPSTA() {
 
 void connectToWiFi_begin() {
   if (!hasSavedWiFi()) return;
-  WiFi.mode(WIFI_AP_STA);
+  // Só volta para AP_STA se o AP ainda estiver de direito ligado (apEnabled).
+  // Usar AP_STA incondicionalmente aqui religava o rádio do AP em toda
+  // reconexão pós-expiração (softAP mantém a config antiga na memória do
+  // driver), inclusive depois do apLifetimeTick já ter desligado.
+  WiFi.mode(apEnabled ? WIFI_AP_STA : WIFI_STA);
   WiFi.begin(activeSSID(), activePass());
   wifiConnecting = true;
   wifiConnectStartMs = millis();

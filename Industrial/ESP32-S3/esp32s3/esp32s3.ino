@@ -72,7 +72,15 @@
 // - Deteccao de zumbi : sem ping/pong por >5min -> reconecta
 // - App ping a cada 30s | heartbeat: 15s/3s/2 tentativas
 //
-// AP: ativo 10 min apos boot (lean mode apos expirar)
+// AP: SO SOBE em evento de energia (ligar na tomada, botao RST, brownout).
+//     Reinicio por software, OTA ou watchdog sobe em STA puro, sem AP — inclusive
+//     o auto-restart de 15min sem WebSocket, que antes ressuscitava o AP na peca
+//     justamente mais precisada de radio para associar. Dura 5 min contados da
+//     ULTIMA interacao com o painel (checkAuth), com teto de 30 min desde o boot
+//     para uma pagina esquecida aberta nao segurar o AP para sempre. Peca sem
+//     Wi-Fi salvo e a excecao: mantem o AP enquanto nao for configurada, porque
+//     ali o STA nao disputa antena com nada. Depois de expirar, lean mode.
+//     Para configurar uma peca ja instalada: tirar da tomada e ligar de novo.
 //     SSID: <nodeId>-AP | Senha: 12345678
 //
 // ARMAZENAMENTO: Preferences (NVS) - ssid, pass, ssid2, pass2, nodeid,
@@ -171,6 +179,26 @@ void logRingPush(const uint8_t* data, size_t len) {
   }
 }
 
+// A peça não tem RTC — a noção de tempo no log vem do NTP assim que ela pega
+// IP (ver ARDUINO_EVENT_WIFI_STA_GOT_IP em onWiFiEvent). time(nullptr) < ano
+// 2020 é o sinal de "ainda não sincronizou" (o clock do ESP32 nasce zerado em
+// 1970); nesse caso cai para tempo decorrido desde o boot, que sempre existe.
+// Fuso fixo -3h (America/Sao_Paulo, sem horário de verão desde 2019) — mesma
+// convenção já usada no backend (ver spNow() em src/websocket.js do FRST-BACK).
+String logTimestamp() {
+  time_t now = time(nullptr);
+  char buf[14];
+  if (now > 1600000000) {  // 2020-09-13 — bem antes de qualquer boot real
+    struct tm t;
+    localtime_r(&now, &t);
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+    return String(buf);
+  }
+  unsigned long s = millis() / 1000;
+  snprintf(buf, sizeof(buf), "+%02lu:%02lu:%02lu", s / 3600, (s / 60) % 60, s % 60);
+  return String(buf);
+}
+
 // Conteúdo atual em ordem cronológica (mais antigo primeiro).
 String logRingRead() {
   size_t start = logRingWrapped ? logRingHead : 0;
@@ -190,15 +218,29 @@ String logRingRead() {
 // de cada configuração de build (native USB vs conversor UART da placa).
 auto& realSerial = Serial;
 class TeeSerial : public Print {
+  // true logo após um '\n' (ou no boot): a próxima escrita começa uma linha
+  // nova no ring buffer, então ganha o prefixo de horário antes do conteúdo.
+  bool atLineStart = true;
+  void pushTee(const uint8_t* buf, size_t size) {
+    for (size_t i = 0; i < size; i++) {
+      if (atLineStart) {
+        String ts = "[" + logTimestamp() + "] ";
+        logRingPush((const uint8_t*)ts.c_str(), ts.length());
+        atLineStart = false;
+      }
+      logRingPush(&buf[i], 1);
+      if (buf[i] == '\n') atLineStart = true;
+    }
+  }
 public:
   void begin(unsigned long baud) { realSerial.begin(baud); }
-  size_t write(uint8_t c) override { logRingPush(&c, 1); return realSerial.write(c); }
-  size_t write(const uint8_t* buf, size_t size) override { logRingPush(buf, size); return realSerial.write(buf, size); }
+  size_t write(uint8_t c) override { pushTee(&c, 1); return realSerial.write(c); }
+  size_t write(const uint8_t* buf, size_t size) override { pushTee(buf, size); return realSerial.write(buf, size); }
 };
 TeeSerial teeSerial;
 #define Serial teeSerial
 
-#define FW_VERSION "1.4.0"   // reportado no 0x03 para auditoria da frota
+#define FW_VERSION "1.5.0"   // reportado no 0x03 para auditoria da frota
 #define FW_CHIP    "esp32s3" // identifica o chip na telemetria / seleção de OTA
 
 // ---------- Potencia de transmissao do radio ----------
@@ -329,30 +371,18 @@ bool gpioLivre(int p) {
   return true;
 }
 
-// Ultimo estado desenhado, para nao reescrever o LED a cada volta do loop: o
-// WS2812 e bit-bang com interrupcoes desabilitadas (~30us por atualizacao), e
-// repetir isso milhares de vezes por segundo e desperdicio puro.
-int lastLedState = -1;
+// Ultimo estado (+fase do pisca-pisca) desenhado, para nao reescrever o LED a
+// cada volta do loop: o WS2812 e bit-bang com interrupcoes desabilitadas
+// (~30us por atualizacao), e repetir isso milhares de vezes por segundo e
+// desperdicio puro. A funcao que decide a cor (ledShow) fica mais abaixo,
+// perto de onde wifiConnecting/isWebSocketConnected sao declaradas.
+int lastLedKey = -1;
 
 void ledSetup() {
-  lastLedState = -1;
+  lastLedKey = -1;
   if (ledMode == LED_MODE_HIGH || ledMode == LED_MODE_LOW) {
     pinMode(ledPin, OUTPUT);
     digitalWrite(ledPin, ledMode == LED_MODE_LOW ? HIGH : LOW);   // comeca apagado
-  }
-}
-
-// Verde = WebSocket conectado | vermelho = sem WebSocket. O brilho e baixo de
-// proposito: o WS2812 no maximo consome ~60mA e ofusca dentro da caixa.
-void ledShow(bool on) {
-  int st = on ? 1 : 0;
-  if (st == lastLedState) return;
-  lastLedState = st;
-  switch (ledMode) {
-    case LED_MODE_RGB:  rgbLedWrite(ledPin, on ? 0 : 12, on ? 12 : 0, 0); break;
-    case LED_MODE_HIGH: digitalWrite(ledPin, on ? HIGH : LOW);            break;
-    case LED_MODE_LOW:  digitalWrite(ledPin, on ? LOW  : HIGH);           break;
-    default: break;   // LED_MODE_OFF: nada a fazer
   }
 }
 
@@ -382,6 +412,21 @@ uint32_t    creditTimer    = 0;            // deadline da fase atual
 
 // ---------- Identity ----------
 String nodeId = "FOREASY";
+
+// Sufixo do MAC de fábrica (2 bytes, 4 dígitos hex) — diferencia o AP de cada
+// peça quando várias sobem juntas em bancada com o nodeId ainda no padrão
+// (mesmo nodeId = SSID igual em todas, dá erro pra conectar na peça certa).
+// Vem do efuse via ESP.getEfuseMac(), não de esp_random(): mesma lógica do
+// jitter do auto-restart abaixo, pelo mesmo motivo — o rádio ainda não subiu
+// neste ponto do boot, e sem Wi-Fi/BT ativo o gerador não é verdadeiramente
+// aleatório (risco real de a frota inteira sortear o mesmo valor). O MAC é
+// único por placa e estável entre reinícios, o que também mantém o nome do
+// AP igual se precisar reconectar na mesma peça depois de um reboot.
+String apSuffix() {
+  char buf[5];
+  snprintf(buf, sizeof(buf), "%04X", (unsigned)(ESP.getEfuseMac() & 0xFFFF));
+  return String(buf);
+}
 
 // ---------- Credenciais cacheadas (carregadas no boot) ----------
 String sSsid, sPass, sSsid2, sPass2;
@@ -429,9 +474,22 @@ const uint8_t WS_HANDSHAKE_FAIL_RESET = 5;
 
 // ---------- AP ----------
 IPAddress apIP(192,168,4,1);
-const uint32_t AP_LIFETIME_MS = 10UL * 60UL * 1000UL;
+// Vida do AP, contada da ULTIMA interacao com o painel (nao do boot): quem
+// passou 20 min configurando nao pode perder o acesso no meio, e quem so ligou
+// a peca nao paga por um AP no ar a toa. Cinco minutos e o suficiente para
+// abrir o celular e conectar; depois disso o radio volta a ser so do Wi-Fi.
+const uint32_t AP_LIFETIME_MS = 5UL * 60UL * 1000UL;
+// Teto absoluto desde o boot. A extensao por interacao nao pode virar cheque em
+// branco: uma pagina esquecida aberta (o /status e o /test-wifi-status sao
+// consultados de tempos em tempos pelo proprio painel) manteria o AP vivo para
+// sempre, e o AP em AP_STA e exatamente a disputa de antena que este projeto ja
+// pagou caro para descobrir.
+const uint32_t AP_JANELA_MAX_MS = 30UL * 60UL * 1000UL;
 bool     apEnabled  = true;
 uint32_t bootTimeMs = 0;
+// Ultima vez que alguem falou com o painel. Empurrada no checkAuth(), que e por
+// onde toda pagina e todo endpoint passam.
+uint32_t apJanelaInicioMs = 0;
 
 // ---------- WiFi STA ----------
 bool     wifiConnecting     = false;
@@ -661,6 +719,12 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     evAdd(EV_WIFI_UP, (int16_t)WiFi.RSSI());
   } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
     evAdd(EV_WIFI_DOWN, (int16_t)info.wifi_sta_disconnected.reason);
+  } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    // Dispara e esquece — configTime() com hostname faz o SNTP sincronizar em
+    // segundo plano; logTimestamp() sozinho detecta quando o relógio já
+    // "pegou" (time(nullptr) > 2020) e troca de "+HH:MM:SS desde o boot" para
+    // hora real. Não bloqueia o event handler nem falha se o NTP não responder.
+    configTime(-3 * 3600, 0, "a.st1.ntp.br", "pool.ntp.org");
   }
 }
 
@@ -846,19 +910,51 @@ void loadPrefs() {
 }
 
 // ================= AP + STA =================
+/**
+ * O AP deve subir NESTE boot?
+ *
+ * So em evento de energia — ligar na tomada, botao RST, brownout (numa fonte
+ * fraca o proprio religar pode ser reportado assim) ou motivo desconhecido (na
+ * duvida, abre: peca inalcancavel e pior). Reinicio por software, OTA, watchdog
+ * ou panico sobem em STA puro, sem AP nenhum.
+ *
+ * A excecao e a peca sem Wi-Fi salvo: ali o AP e o unico caminho, o STA nao tem
+ * o que fazer com o radio e nao existe disputa a proteger. Essa fica com AP
+ * enquanto nao for configurada — e o "ou enquanto a peca nao tiver
+ * configuracoes" da regra.
+ *
+ * Para reabrir o AP numa peca ja instalada: tirar da tomada e ligar de novo.
+ */
+bool apDeveSubir() {
+  if (!hasSavedWiFi()) return true;
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:
+    case ESP_RST_EXT:
+    case ESP_RST_BROWNOUT:
+    case ESP_RST_UNKNOWN:
+      return true;
+    default:
+      return false;
+  }
+}
+
 void setupAPSTA() {
+  apJanelaInicioMs = millis();
   WiFi.mode(WIFI_AP_STA);
-  WiFi.setTxPower(activeTxPower());
-  String apName = nodeId + "-AP";
+  String apName = nodeId + "-" + apSuffix() + "-AP";
   // Canal da última conexão bem-sucedida, não 1 fixo: em AP+STA o rádio é único e
   // um AP em canal diferente do roteador impede a associação do STA.
   int apCh = (wifiChannelHint >= 1 && wifiChannelHint <= 13) ? wifiChannelHint : 1;
   WiFi.softAP(apName.c_str(), "12345678", apCh, false);
   delay(200);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
-  // Segunda aplicação, agora com o AP no ar: a de cima roda logo após o mode() e
-  // pode ter caído no guard de "nenhuma interface iniciada". O tx= do log abaixo
-  // é a leitura real do rádio, então serve de conferência.
+  // Mesma corrida assíncrona do START bit documentada em applyTxPower(): o
+  // delay(200) acima não garante que a interface já reportou START, e uma
+  // peça já configurada com WiFi salvo nasce mirando potência cheia — este é
+  // o primeiro boot do rádio na sessão inteira, vale a pena esperar direito
+  // em vez de confiar só no delay fixo.
+  uint32_t t0boot = millis();
+  while (!radioStarted() && (millis() - t0boot) < 500) delay(10);
   applyTxPower();
   // O tx= é leitura real do rádio; -1 quando nenhuma interface subiu ainda (nesse
   // caso getTxPower() devolveria 19,5 de fallback e o log mentiria).
@@ -869,7 +965,13 @@ void setupAPSTA() {
 
 void connectToWiFi_begin() {
   if (!hasSavedWiFi()) { Serial.println("Sem credenciais WiFi."); return; }
-  WiFi.mode(WIFI_AP_STA);
+  // Só volta para AP_STA se o AP ainda estiver de direito ligado (apEnabled).
+  // Usar AP_STA incondicionalmente aqui religava o rádio do AP em toda
+  // reconexão pós-expiração (softAP mantém a config antiga na memória do
+  // driver), inclusive depois do apLifetimeTick já ter desligado — a peça
+  // ficava com dois rádios ativos pelo resto do boot: mais calor e o
+  // apLifetimeTick nunca mais disparava de novo (apEnabled já false).
+  WiFi.mode(apEnabled ? WIFI_AP_STA : WIFI_STA);
   // Trocar de modo reseta a potência para o máximo, e este é o caminho crítico:
   // um failover faz WiFi.disconnect(true), que derruba o rádio inteiro
   // (mode(0) -> esp_wifi_stop). Ao voltar, as interfaces levam alguns
@@ -915,13 +1017,22 @@ void startWifiTest(const String& ssid, const String& pass, int ch) {
   isWebSocketConnected = false;
   WiFi.disconnect(false);
   delay(40);
-  if (ch >= 1 && ch <= 13) {
-    String apName = nodeId + "-AP";
+  // So mexe no AP se ele ainda estiver de direito no ar. Sem o apEnabled aqui,
+  // um /test-wifi disparado pelo painel da REDE LOCAL (que responde mesmo sem
+  // AP) recriava o softAP com apEnabled ja em false — ou seja, um AP no ar que
+  // o apLifetimeTick nunca mais desligava, porque ele so age quando apEnabled e
+  // true. A peca ficava em AP_STA disputando antena pelo resto do boot.
+  if (apEnabled && ch >= 1 && ch <= 13) {
+    String apName = nodeId + "-" + apSuffix() + "-AP";
     WiFi.softAP(apName.c_str(), "12345678", ch, false);
     WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
     delay(60);
   }
-  applyTxPower();   // recriar o softAP em outro canal também mexe no rádio
+  // Recriar o softAP em outro canal também mexe no rádio — mesma corrida
+  // assíncrona do START bit de sempre, o delay(60) acima não garante nada.
+  uint32_t t0test = millis();
+  while (!radioStarted() && (millis() - t0test) < 500) delay(10);
+  applyTxPower();
   WiFi.begin(ssid.c_str(), pass.c_str());
   Serial.printf("TEST WiFi: SSID=%s ch=%d\n", ssid.c_str(), ch);
 }
@@ -1233,7 +1344,7 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
           snprintf(buf, sizeof(buf),
             "{\"rssi\":%d,\"ch\":%d,\"heap\":%u,\"block\":%u,\"cpu\":%u,"
             "\"uptime\":%lu,\"boots\":%lu,\"wifiSlot\":%u,\"temp\":%.1f,"
-            "\"txp\":%.1f,\"rst\":\"%s\","
+            "\"txp\":%.1f,\"rst\":\"%s\",\"ap\":%d,"
             "\"machineMode\":1,\"pulse\":%s,\"chip\":\"%s\",\"fw\":\"%s\"}",
             staOk ? WiFi.RSSI() : 0,
             staOk ? (int)WiFi.channel() : 0,
@@ -1246,6 +1357,7 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             readInternalTempC(),
             radioStarted() ? WiFi.getTxPower() / 4.0 : -1.0,
             resetReasonStr(),
+            apEnabled ? 1 : 0,
             pulseActive ? "true" : "false",
             FW_CHIP,
             FW_VERSION
@@ -1403,16 +1515,86 @@ void setup() {
   enableLoopWDT();
   Serial.printf("Loop watchdog ativo (%lus)\n", (unsigned long)LOOP_WDT_TIMEOUT_S);
 
-  setupAPSTA();
+  // O AP so sobe em evento de energia. Configurar peca e coisa que se faz com
+  // ela na mao, ligando na tomada — e o custo de deixar o AP subir em qualquer
+  // reinicio e alto: em AP_STA o radio e unico, o AP prende o canal e a peca
+  // que mais precisa associar (a que esta reiniciando sozinha por falta de
+  // WebSocket, a cada ~15min) era justamente a que ressuscitava o AP toda vez.
+  if (apDeveSubir()) {
+    setupAPSTA();
+  } else {
+    apEnabled = false;
+    WiFi.mode(WIFI_STA);
+    Serial.printf("AP nao sobe neste boot (reset=%s, peca ja configurada). "
+                  "Para configurar: tirar da tomada e ligar de novo.\n",
+                  resetReasonStr());
+  }
+
+  // O servidor web sobe sempre: sem AP ele continua respondendo pelo IP da rede
+  // local, que e como o painel /info e /admin sao usados na peca em operacao.
   startWebServer();
   server.begin();
-  Serial.printf("HTTP server iniciado. modo=INDUSTRIAL chip=%s fw=%s\n",
-                FW_CHIP, FW_VERSION);
+  Serial.printf("HTTP server iniciado. modo=INDUSTRIAL chip=%s fw=%s ap=%d\n",
+                FW_CHIP, FW_VERSION, apEnabled ? 1 : 0);
 
-  WiFi.scanNetworks(true);
+  // Pre-aquecer a lista de redes so interessa se alguem for abrir o wizard
+  // agora; sem AP, e so gasto de radio no pior momento do boot. O /scan dispara
+  // o seu proprio scan quando a pagina pede.
+  if (apEnabled) WiFi.scanNetworks(true);
 
   if (hasSavedWiFi()) connectToWiFi_begin();
   else Serial.println("Sem WiFi salvo. Configure pelo AP.");
+}
+
+// ---------- LED de status: estados e cores ----------
+// Prioridade de cima para baixo (o primeiro que bater vence):
+//   AP_WAIT    roxo solido       | sem WiFi salvo - peca nova/resetada aguardando configuracao (normal)
+//   CONNECTING vermelho piscando | tentativa de conexao em andamento (transitorio, ate WIFI_MAX_WAIT_MS)
+//   NO_WIFI    vermelho solido   | tem credencial salva mas nao conseguiu conectar (problema real)
+//   WIFI_ONLY  verde solido      | WiFi ok, WebSocket fora (rede local ok, backend/servidor fora)
+//   ONLINE     azul solido       | WiFi + WebSocket ok - tudo certo
+// No LED comum (HIGH/LOW, nao-RGB) so da para ligar/desligar/piscar - sem cor
+// nao da para diferenciar os 5 estados, entao ele so acende fixo em ONLINE e
+// pisca em CONNECTING; os demais ficam apagados.
+enum LedState : uint8_t { LED_ST_AP_WAIT = 0, LED_ST_CONNECTING, LED_ST_NO_WIFI, LED_ST_WIFI_ONLY, LED_ST_ONLINE };
+const uint32_t LED_BLINK_MS = 300;   // ~1,7 Hz
+
+uint8_t ledCurrentState() {
+  if (!hasSavedWiFi())               return LED_ST_AP_WAIT;
+  if (wifiConnecting)                return LED_ST_CONNECTING;
+  if (WiFi.status() != WL_CONNECTED) return LED_ST_NO_WIFI;
+  if (!isWebSocketConnected)         return LED_ST_WIFI_ONLY;
+  return LED_ST_ONLINE;
+}
+
+// Brilho baixo de proposito: o WS2812 no maximo consome ~60mA e ofusca dentro da caixa.
+void ledShow() {
+  uint8_t st = ledCurrentState();
+  bool blinking = (st == LED_ST_CONNECTING);
+  bool phaseOn  = !blinking || (((millis() / LED_BLINK_MS) % 2) == 0);
+
+  int key = ((int)st << 1) | (phaseOn ? 1 : 0);
+  if (key == lastLedKey) return;
+  lastLedKey = key;
+
+  uint8_t r = 0, g = 0, b = 0;
+  if (phaseOn) {
+    switch (st) {
+      case LED_ST_AP_WAIT:    r = 8;  g = 0;  b = 8;  break;   // roxo
+      case LED_ST_CONNECTING: r = 12; g = 0;  b = 0;  break;   // vermelho (piscando)
+      case LED_ST_NO_WIFI:    r = 12; g = 0;  b = 0;  break;   // vermelho solido
+      case LED_ST_WIFI_ONLY:  r = 0;  g = 12; b = 0;  break;   // verde
+      case LED_ST_ONLINE:     r = 0;  g = 0;  b = 12; break;   // azul
+    }
+  }
+  bool litSimple = (st == LED_ST_ONLINE) || (blinking && phaseOn);
+
+  switch (ledMode) {
+    case LED_MODE_RGB:  rgbLedWrite(ledPin, r, g, b);                  break;
+    case LED_MODE_HIGH: digitalWrite(ledPin, litSimple ? HIGH : LOW);  break;
+    case LED_MODE_LOW:  digitalWrite(ledPin, litSimple ? LOW  : HIGH); break;
+    default: break;   // LED_MODE_OFF: nada a fazer
+  }
 }
 
 // ================= LOOP =================
@@ -1432,7 +1614,7 @@ void loop() {
   otaTick();
   restartTick();
 
-  ledShow(isWebSocketConnected);
+  ledShow();
 }
 
 // ================= TICKS =================
@@ -1470,6 +1652,11 @@ void wifiTick() {
         WiFi.softAPdisconnect(true);
         apEnabled = false;
         lastConnectivityOkMs = millis();
+        // Mesma corrida assíncrona do START bit documentada em applyTxPower():
+        // sem esperar radioStarted(), a reaplicação abaixo podia falhar em
+        // silêncio bem no instante em que o rádio troca de modo.
+        uint32_t t0drop = millis();
+        while (!radioStarted() && (millis() - t0drop) < 500) delay(10);
         applyTxPower();
       }
       if (wifiFailStreak >= WIFI_FAIL_HARD_RESET && hardResetPermitido()) {
@@ -1612,24 +1799,35 @@ void watchdogTick() {
 }
 
 void apLifetimeTick() {
-  if (apEnabled && (millis() - bootTimeMs >= AP_LIFETIME_MS)) {
-    Serial.println("AP lifetime expirou. Desligando AP.");
-    WiFi.softAPdisconnect(true);
-    // ESTE é o ponto que faltava. softAPdisconnect(true) é uma troca de modo
-    // (AP_STA -> STA) e derruba a potência de volta para 19,5 dBm. Era a única
-    // troca de modo do firmware que não reaplicava o limite: a peça saía do
-    // minuto 10 transmitindo em potência cheia, que é justamente o que este
-    // lote de placas não sustenta (docs/LAUDO-LOTE-ESP32C3.md).
-    applyTxPower();
-    apEnabled = false;
-    lastConnectivityOkMs = millis();
-    if (wifiTestActive) {
-      wifiTestActive = false;
-      wifiTestState  = TST_IDLE;
-      wifiTestDoneMs = 0;
-      WiFi.disconnect(false);
-      if (hasSavedWiFi()) connectToWiFi_begin();
-    }
+  if (!apEnabled) return;
+  // Peca sem Wi-Fi salvo mantem o AP: e o unico canal que ela tem, e sem
+  // credencial o STA nao esta tentando associar nada — nao ha disputa de antena
+  // a proteger. Antes o AP caia aos 10 min mesmo nessa peca, que ficava
+  // inalcancavel ate alguem reiniciar.
+  if (!hasSavedWiFi()) return;
+  bool janelaViva = (millis() - apJanelaInicioMs) < AP_LIFETIME_MS
+                    && (millis() - bootTimeMs)    < AP_JANELA_MAX_MS;
+  if (janelaViva) return;
+
+  Serial.println("AP lifetime expirou. Desligando AP.");
+  WiFi.softAPdisconnect(true);
+  // softAPdisconnect(true) é uma troca de modo (AP_STA -> STA) e derruba a
+  // potência de volta para 19,5 dBm. Reaplicar o limite não basta chamar
+  // direto: mesma corrida assíncrona do START bit documentada em
+  // applyTxPower() — sem esperar radioStarted(), a chamada abaixo podia
+  // falhar em silêncio e deixar a peça exposta em potência cheia até o
+  // txPowerTick() periódico corrigir (até 5s depois).
+  uint32_t t0ap = millis();
+  while (!radioStarted() && (millis() - t0ap) < 500) delay(10);
+  applyTxPower();
+  apEnabled = false;
+  lastConnectivityOkMs = millis();
+  if (wifiTestActive) {
+    wifiTestActive = false;
+    wifiTestState  = TST_IDLE;
+    wifiTestDoneMs = 0;
+    WiFi.disconnect(false);
+    if (hasSavedWiFi()) connectToWiFi_begin();
   }
 }
 
@@ -1639,6 +1837,12 @@ void wsRestartTick() {
   // 15min não resolve nada e só atrapalha quem estiver configurando. Idem
   // durante um teste do wizard.
   if (!hasSavedWiFi() || wifiTestActive) { wsLastOkMs = millis(); return; }
+  // AP no ar significa instalador na peca (ele so sobe em religamento e so dura
+  // enquanto o painel e usado). Reiniciar aqui derrubaria o AP no meio da
+  // configuracao — e, pela regra nova, ele NAO voltaria: reinicio por software
+  // sobe sem AP. A janela do AP ja e limitada por AP_JANELA_MAX_MS, entao este
+  // adiamento nao e cheque em branco.
+  if (apEnabled) return;
   // Só adia o reinício enquanto o pulso está no ar — sem empurrar wsLastOkMs,
   // que agora também é o relógio do backoff. Empurrá-lo aqui zeraria o downtime
   // e jogaria o intervalo de reconexão de volta para 1s.
@@ -1682,6 +1886,9 @@ void generateSessionToken() {
 bool checkAuth() {
   if (server.hasHeader("Cookie") &&
       server.header("Cookie").indexOf(String("session=") + sessionToken) != -1) {
+    // Tem gente usando o painel: empurra a janela do AP. Passa por aqui toda
+    // pagina e todo endpoint, entao e o unico ponto que precisa saber disso.
+    apJanelaInicioMs = millis();
     return true;
   }
   server.sendHeader("Location", "/login");
@@ -2128,7 +2335,16 @@ select option{background:var(--cd)}
       <option value="2">LED comum — ativo LOW</option>
       <option value="0">Desligado</option>
     </select>
-    <div style="color:var(--mu);font-size:10px;line-height:1.5;margin-top:8px">Verde = WebSocket conectado, vermelho = sem conexão. O DevKit traz o RGB no <b>GPIO48</b>; algumas revisões usam o <b>38</b>.</div>
+    <div style="color:var(--mu);font-size:10px;line-height:1.5;margin-top:8px">
+      <b>Legenda (RGB):</b><br>
+      🟣 Roxo sólido — sem WiFi salvo, aguardando configuração (normal em peça nova)<br>
+      🔴 Vermelho piscando — tentando conectar ao WiFi<br>
+      🔴 Vermelho sólido — tem WiFi salvo mas não conseguiu conectar (problema)<br>
+      🟢 Verde sólido — WiFi ok, WebSocket fora<br>
+      🔵 Azul sólido — WiFi + WebSocket ok, tudo certo<br>
+      No LED comum (não-RGB): aceso fixo = tudo certo, piscando = tentando conectar, apagado = qualquer outro estado.<br>
+      O DevKit traz o RGB no <b>GPIO48</b>; algumas revisões usam o <b>38</b>.
+    </div>
     <button class="btn" id="bLed">Salvar LED</button>
   </div>
   <div class="box">
@@ -2327,6 +2543,7 @@ void handleStatusJson() {
   json += "\"creditState\":"  + String((int)creditState) + ",";
   json += "\"wifiSlot\":"     + String(wifiSlot) + ",";
   json += "\"rst\":\""        + String(resetReasonStr()) + "\",";
+  json += "\"ap\":"           + String(apEnabled ? 1 : 0) + ",";
   // Caixa-preta no /status: o /info já despeja este JSON inteiro no bloco final,
   // então quem está na frente da peça lê o histórico ANTES de reiniciar — que é
   // exatamente o momento em que ele seria perdido se dependesse só do envio.
