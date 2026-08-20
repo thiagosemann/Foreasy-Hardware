@@ -101,8 +101,9 @@ firmware gravado.
     Potência de TX configurável (NVS `txpower`) e peça virgem nasce em **15 dBm** —
     fail-safe para o lote de placas do laudo, que a 19,5 dBm não sobe nem o próprio AP.
   - **S3 (N16R8)**: `esp32s3.ino` é o porte do C3 1.3.0 — mesma lógica, mesmo protocolo,
-    mesmas telas; **corrija bug de lógica nos dois**. Padrões: `startPin` GPIO5,
-    `availPin` GPIO6, `ledPin` GPIO48.
+    mesmas telas; **corrija bug de lógica nos dois**. Padrões: `startPin` GPIO42,
+    `availPin` GPIO40, `ledPin` GPIO48. Os pinos vivem na NVS, então trocar o padrão
+    só vale para peça nova — peça já configurada mantém o que tem gravado.
     - **LED** (`ledMode`, NVS): 0=desligado, 1=comum ativo HIGH, 2=comum ativo LOW,
       3=**RGB WS2812** (padrão). O DevKit não tem LED monocromático de usuário, só o
       endereçável — e algumas revisões o trazem no GPIO38 em vez do 48, daí pino e modo
@@ -111,8 +112,11 @@ firmware gravado.
       + PSRAM octal). Pino errado aí é peça que não dá boot — conserto presencial, nem
       OTA alcança. Livres: 0–18, 21 e 38–48 (0/3/45/46 strapping e 43/44 UART0 passam,
       mas evite).
-    - Nasce em **19,5 dBm**: o fail-safe de 15 dBm do C3 não se aplica aqui, e nascer
-      rebaixada custaria alcance de subida sem resolver problema nenhum.
+    - **Sem controle de potência de TX** — nem no `esp32s3.ino`, nem no `esp32s3_ble.ino`.
+      Opera sempre na potência cheia do core (19,5 dBm): esta placa sustenta o pico de
+      corrente do TX, então o ajuste do C3 aqui não teria caso de uso, e o fallback de
+      potência do watchdog dá lugar ao failover de rede. Sobra o campo `txp` no `0x03` e
+      no `/status`, que é leitura de volta do rádio e serve só para conferência.
     - **Build — a flash marcada tem de bater com o chip real.** Estes DevKits são
       anunciados como N16R8 e chegam **N8R2**; marcar 16MB numa placa de 8MB grava
       sem erro e a peça entra em pânico em loop no bootloader (`Detected size(8192k)
@@ -292,3 +296,12 @@ CH340 podem dar glitch no DTR ao energizar).
 - ALPM-39201 — manual elétrico (Alliance Laundry Systems)
 - 204370ENR1 — manual de programação Quantum (jan/2019)
 - Schematic 807300 — Control Option Wiring Diagram (Commercial FLW)
+
+**Plataforma H13** (mais nova que o Quantum 440G da §6 — porta de pagamento
+multiplexada por software, opção `SErPAy`): ver
+[docs/DIAGNOSTICO-AVAIL-SPEED-QUEEN.md](docs/DIAGNOSTICO-AVAIL-SPEED-QUEEN.md).
+
+- D518600ENR3 — manual de programação, secador DV6000WE (jan/2024)
+- 807870ENR5 — manual de programação, lavadora frontal (mai/2025)
+- 205160ENR3 — manual de programação, lavadora TV6000WN (2023)
+- D514575ENR11 — manual de programação, secador plataforma antiga (nov/2025)

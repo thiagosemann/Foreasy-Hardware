@@ -259,20 +259,80 @@ const int TXPOWER_MAX_Q  = 78;   // 19,5 dBm
 const int TXPOWER_BOOT_Q = 60;   // 15 dBm — fail-safe de peça virgem
 wifi_power_t txPower = (wifi_power_t)TXPOWER_BOOT_Q;   // alvo configurado
 
-// Fallback automático de potência. Depois de falha sustentada de conexão, a peça
-// passa a tentar o OUTRO nível — e fica no que funcionar. Cobre os dois sentidos:
-// placa do lote fraco presa em 19,5 dBm cai para 15 e conecta; placa boa em ponto
-// de sinal ruim, presa em 15, sobe para 19,5 e conecta.
+// ---------- Fallback automático de potência ----------
+// Depois de falha sustentada de conexão, a peça passa a tentar OUTROS níveis de
+// potência e fica no primeiro que funcionar. Nada é gravado na NVS: se a peça
+// reiniciar, volta ao valor que o instalador configurou.
 //
-// É diferente de escolher a potência por um teste no boot, que dá falso positivo
-// em placa marginal: aqui só agimos após minutos de falha real, e o critério é o
-// único que importa — conectou ou não. Nada é gravado na NVS: se a peça reiniciar,
-// volta ao valor configurado.
-bool txPowerFallback = false;
+// É uma ESCADA, e não o alterna-entre-dois-extremos que existia aqui antes:
+//
+//     (txPower > 15 dBm) ? 15 dBm : 19,5 dBm
+//
+// Aquilo tinha um defeito grave. Qualquer peça configurada em 15 dBm OU MENOS
+// caía no ramo de baixo e era promovida direto ao MÁXIMO — e "configurada abaixo
+// do padrão" é, na prática, sinônimo de "peça reprovada no teste de bancada",
+// porque é a única razão para alguém mexer nisso. Ou seja: o watchdog levava
+// justamente a peça frágil ao ponto onde ela não transmite
+// (docs/LAUDO-LOTE-ESP32C3.md), e ela ficava lá até o próximo reinício. O
+// fail-safe do laudo era desfeito sozinho a cada 6 min de WebSocket fora
+// (WS_DOWN_RESET_MS x 2 escaladas) — medido em campo, agosto/2026, numa
+// instalação inteira gravada em 15 dBm de propósito.
+//
+// A escada tenta, a partir do valor configurado e nesta ordem:
+//     passo 1 -> um degrau ABAIXO   (direção segura: menos pico de corrente)
+//     passo 2 -> um degrau ACIMA    (peça boa num ponto de sinal fraco)
+//     passo 3 -> dois abaixo | passo 4 -> dois acima | ...
+// Sempre começando pelo lado que não pode quebrar a peça, e sem nunca saltar
+// direto para um extremo. Degrau fora da escada é pulado; esgotados os dois
+// lados, volta ao configurado — se nenhum nível resolveu, o problema não é
+// potência, e ficar preso num extremo é pior do que respeitar a configuração.
+const wifi_power_t TXPOWER_ESCADA[] = {
+  (wifi_power_t)78, (wifi_power_t)68, (wifi_power_t)60, (wifi_power_t)52,
+  (wifi_power_t)44, (wifi_power_t)34, (wifi_power_t)20
+};  // 19,5 | 17 | 15 | 13 | 11 | 8,5 | 5 dBm
+const uint8_t TXPOWER_ESCADA_N = sizeof(TXPOWER_ESCADA) / sizeof(TXPOWER_ESCADA[0]);
+
+uint8_t txPowerFallbackPasso = 0;   // 0 = sem fallback, vale o configurado
+
+// Degrau mais PRÓXIMO do valor configurado, não o igual: o /admin aceita
+// qualquer valor entre TXPOWER_MIN_Q e TXPOWER_MAX_Q, não só os sete da escada.
+uint8_t txPowerBaseIdx() {
+  uint8_t melhor = 0;
+  int menorDist = 0x7FFF;
+  for (uint8_t i = 0; i < TXPOWER_ESCADA_N; i++) {
+    int d = (int)TXPOWER_ESCADA[i] - (int)txPower;
+    if (d < 0) d = -d;
+    if (d < menorDist) { menorDist = d; melhor = i; }
+  }
+  return melhor;
+}
+
+// Índice na escada para um passo do zigue-zague. Índice maior = potência menor,
+// então passo ÍMPAR desce e passo PAR sobe. -1 = degrau fora da escada.
+int txPowerEscadaIdx(uint8_t passo) {
+  int base = (int)txPowerBaseIdx();
+  if (passo == 0) return base;
+  int salto = (passo + 1) / 2;                    // 1,1,2,2,3,3...
+  int idx   = (passo % 2) ? base + salto : base - salto;
+  return (idx < 0 || idx >= (int)TXPOWER_ESCADA_N) ? -1 : idx;
+}
+
 wifi_power_t activeTxPower() {
-  if (!txPowerFallback) return txPower;
-  return (txPower > (wifi_power_t)TXPOWER_BOOT_Q) ? (wifi_power_t)TXPOWER_BOOT_Q
-                                                  : (wifi_power_t)TXPOWER_MAX_Q;
+  if (txPowerFallbackPasso == 0) return txPower;
+  int idx = txPowerEscadaIdx(txPowerFallbackPasso);
+  return (idx < 0) ? txPower : TXPOWER_ESCADA[idx];
+}
+
+// Avança para o próximo degrau que exista de fato. O teto do laço é o dobro do
+// tamanho da escada: o zigue-zague gasta dois passos por degrau de distância,
+// então passado isso os dois lados já se esgotaram.
+void txPowerFallbackAvancar() {
+  const uint8_t MAX_PASSO = TXPOWER_ESCADA_N * 2;
+  while (txPowerFallbackPasso < MAX_PASSO) {
+    txPowerFallbackPasso++;
+    if (txPowerEscadaIdx(txPowerFallbackPasso) >= 0) return;
+  }
+  txPowerFallbackPasso = 0;   // escada esgotada: respeita o configurado
 }
 
 // ---------- Reafirmação da potência ----------
@@ -302,7 +362,14 @@ bool radioStarted() { return WiFi.STA.started() || WiFi.AP.started(); }
 bool applyTxPower() {
   if (!radioStarted()) return false;
   wifi_power_t alvo = activeTxPower();
-  if (WiFi.getTxPower() <= alvo) return true;
+  // Aplica nos DOIS sentidos. Havia aqui um `if (getTxPower() <= alvo) return
+  // true;` que tornava o degrau de SUBIDA da escada letra morta: com o rádio em
+  // 15 dBm e alvo de 17, a função concluía que já estava bom e nunca chamava
+  // setTxPower(). O alvo de cima só valia por acidente, quando uma troca de modo
+  // devolvia o rádio ao máximo e a chamada seguinte o puxava para baixo.
+  // Quem impede a potência de subir SOZINHA continua sendo o txPowerTick() logo
+  // abaixo, que compara com ">"; aqui é escolha deliberada — esta função só roda
+  // no boot, na troca de modo e em cada tentativa de conexão.
   WiFi.setTxPower(alvo);
   return WiFi.getTxPower() <= alvo;
 }
@@ -1658,13 +1725,15 @@ void watchdogTick() {
         } else {
           Serial.println("WATCHDOG: WS down persistente. Failover + fallback de potencia.");
           wsDownEscalation = 0;
-          // Alterna a potência: se o problema for a placa não sustentar o TX (ou o
-          // contrário, sinal fraco demais para a potência reduzida), o outro nível
-          // resolve. Não grava na NVS — é tentativa, não configuração.
-          txPowerFallback = !txPowerFallback;
-          Serial.printf("TXPOWER: fallback %s -> alvo %.1f dBm\n",
-                        txPowerFallback ? "ligado" : "desligado",
-                        activeTxPower() / 4.0);
+          // Anda um degrau na escada de potência: se o problema for a placa não
+          // sustentar o pico do TX (ou o contrário, sinal fraco demais para a
+          // potência reduzida), outro nível resolve. Não grava na NVS — é
+          // tentativa, não configuração.
+          txPowerFallbackAvancar();
+          Serial.printf("TXPOWER: fallback passo %u -> alvo %.1f dBm (configurado %.1f)\n",
+                        (unsigned)txPowerFallbackPasso,
+                        activeTxPower() / 4.0,
+                        txPower / 4.0);
           evAdd(EV_WD_FAIL, (int16_t)wifiSlot);
           failoverReconnect();
         }
@@ -2332,7 +2401,7 @@ void handleSave() {
   if (server.hasArg("availEn"))  { availEnabled = server.arg("availEn").toInt() == 1; prefs.putInt("availEn", availEnabled ? 1 : 0); any = true; }
   // txpower em quartos de dBm (unidade do enum wifi_power_t). O constrain evita
   // que um valor absurdo vindo da URL desligue o rádio da peça em campo.
-  if (server.hasArg("txpower"))  { int q = constrain(server.arg("txpower").toInt(), TXPOWER_MIN_Q, TXPOWER_MAX_Q); txPower = (wifi_power_t)q; prefs.putInt("txpower", q); any = true; }
+  if (server.hasArg("txpower"))  { int q = constrain(server.arg("txpower").toInt(), TXPOWER_MIN_Q, TXPOWER_MAX_Q); txPower = (wifi_power_t)q; prefs.putInt("txpower", q); txPowerFallbackPasso = 0; any = true; }
   // "wsrestart" saiu de cena: o auto-restart passou a ser incondicional. A chave
   // antiga na NVS é simplesmente ignorada, então peças já configuradas não
   // precisam ser mexidas — inclusive as que tinham o valor salvo como 0.

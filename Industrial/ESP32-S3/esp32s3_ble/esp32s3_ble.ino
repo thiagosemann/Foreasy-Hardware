@@ -108,8 +108,8 @@
 //
 // ---------------------------------------------------------------------------
 // PINOS (na NVS; sem painel, so por regravacao) - padroes desta placa:
-// - startPin : GPIO5  (START IN, ativo HIGH)
-// - availPin : GPIO6  (AVAIL OUT, INPUT_PULLUP)
+// - startPin : GPIO42 (START IN, ativo HIGH)
+// - availPin : GPIO40 (AVAIL OUT, INPUT_PULLUP)
 // - ledPin   : GPIO48 em modo RGB (LED WS2812 embutido do DevKit)
 //
 // GPIOs PROIBIDOS no S3 - gpioLivre() recusa no loadPrefs(), entao um valor
@@ -336,8 +336,8 @@ WebSocketsClient webSocket;
 Preferences prefs;
 
 // ---------- IO (pinos configuraveis no /admin, persistidos na NVS) ----------
-int startPin = 5;   // pulso START IN (Speed Queen H3-7), ativo HIGH
-int availPin = 6;   // leitura AVAIL OUT (Speed Queen H3-4), INPUT_PULLUP
+int startPin = 42;  // pulso START IN (Speed Queen H3-7), ativo HIGH
+int availPin = 40;  // leitura AVAIL OUT (Speed Queen H3-4), INPUT_PULLUP
 
 // ---------- LED de status ----------
 // O DevKit S3 N16R8 nao tem LED monocromatico de usuario - o unico LED
@@ -861,13 +861,11 @@ void loadPrefs() {
   availEnabled     = (prefs.getInt("availEn", 0) != 0);
   ledPin           = prefs.getInt("ledPin",  ledPin);
   ledMode          = (uint8_t)constrain(prefs.getInt("ledMode", ledMode), 0, 3);
-  // 0 = chave ausente (nenhum valor valido e 0) -> potencia cheia, o padrao desta
-  // placa. So opera reduzido quem salvou um valor menor pelo /admin.
   bootCount        = prefs.getUInt("bootCount",   0);
   // Pino invalido gravado (placa trocada, digitacao errada num /save antigo) volta
   // ao padrao em vez de virar peca sem boot.
-  if (!gpioLivre(startPin)) startPin = 5;
-  if (!gpioLivre(availPin)) availPin = 6;
+  if (!gpioLivre(startPin)) startPin = 42;
+  if (!gpioLivre(availPin)) availPin = 40;
   if (!gpioLivre(ledPin))   ledPin   = 48;
 }
 

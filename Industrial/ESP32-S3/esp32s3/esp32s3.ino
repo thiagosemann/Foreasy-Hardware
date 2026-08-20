@@ -48,10 +48,10 @@
 //   O backend cruza com is_in_use antes de marcar a ficha (nao toca is_in_use).
 //
 // WIFI:
-// - Potencia de TX configuravel por peca no /admin (NVS "txpower"). Nesta placa o
-//   padrao e 19,5 dBm (potencia cheia) - ver o bloco de comentario da secao.
-//   Reafirmada a cada 5s (txPowerTick), porque toda troca de modo devolve o radio
-//   ao maximo. Confira pelo campo "txp" em /status, que e leitura de volta do radio.
+// - Potencia de TX fixa na potencia cheia do core (19,5 dBm), sem ajuste: esta
+//   placa sustenta o pico de corrente do TX, ao contrario do lote de C3 do laudo
+//   (docs/LAUDO-LOTE-ESP32C3.md). Igual ao esp32s3_ble.ino. O campo "txp" em
+//   /status e no 0x03 e leitura de volta do radio, so informativa.
 // - Dual WiFi com failover automatico entre rede 1 e rede 2 (sem restart)
 // - Conexao nao-bloqueante: wifiTick() com timeout 40s e retry a cada 5s
 // - Escada de associacao: 2 falhas -> disconnect(true) (reset de pilha);
@@ -85,15 +85,15 @@
 //
 // ARMAZENAMENTO: Preferences (NVS) - ssid, pass, ssid2, pass2, nodeid,
 //                wsHost, wsPort, startPin, availPin, availEn, ledPin, ledMode,
-//                txpower, wifich, bootCount, evlog
+//                wifich, bootCount, evlog
 //
 // SCAN WIFI: assincrono (nao bloqueia o loop)
 // TEMPERATURA: sensor interno do ESP32-S3 via temperatureRead()
 //
 // ---------------------------------------------------------------------------
 // PINOS (configuraveis no /admin) - padroes desta placa:
-// - startPin : GPIO5  (START IN, ativo HIGH)
-// - availPin : GPIO6  (AVAIL OUT, INPUT_PULLUP)
+// - startPin : GPIO42 (START IN, ativo HIGH)
+// - availPin : GPIO40 (AVAIL OUT, INPUT_PULLUP)
 // - ledPin   : GPIO48 em modo RGB (LED WS2812 embutido do DevKit)
 //
 // GPIOs PROIBIDOS no S3 - gpioLivre() recusa no /save, entao um engano de
@@ -243,88 +243,12 @@ TeeSerial teeSerial;
 #define FW_VERSION "1.5.0"   // reportado no 0x03 para auditoria da frota
 #define FW_CHIP    "esp32s3" // identifica o chip na telemetria / seleção de OTA
 
-// ---------- Potencia de transmissao do radio ----------
-// Configuravel POR PECA no /admin e persistida na NVS (chave "txpower", em
-// quartos de dBm - a unidade do proprio enum wifi_power_t).
-// PADRAO DESTA PLACA: 19,5 dBm, o maximo do core.
-//
-// No C3 esta opcao nasceu como remedio, nao como ajuste: o lote ruim nao emitia
-// nem o beacon do proprio AP em potencia cheia, entao la a peca virgem tinha de
-// NASCER em 15 dBm, senao era impossivel configura-la (docs/LAUDO-LOTE-ESP32C3.md).
-// Aqui nao existe esse fail-safe, de proposito: a migracao para o S3 e a saida
-// daquele hardware, e nascer rebaixada custaria alcance de subida em toda a frota
-// para resolver um problema que esta placa nao tem.
-//
-// O controle continua existindo para o caso oposto - instalacao alimentada por
-// fonte ou cabo USB ruim, onde o pico do TX afunda o 3V3. O sintoma que justifica
-// reduzir e o do laudo, e so ele: a peca associa a 15 dBm e falha a 19,5.
-//
-// Enum, em quartos de dBm: 19,5=78 - 17=68 - 15=60 - 13=52 - 11=44 - 8,5=34 - 5=20
-const int TXPOWER_MIN_Q     =  8;   // 2 dBm - piso de sanidade
-const int TXPOWER_MAX_Q     = 78;   // 19,5 dBm - padrao
-const int TXPOWER_REDUCED_Q = 60;   // 15 dBm - o degrau do fallback automatico
-wifi_power_t txPower = (wifi_power_t)TXPOWER_MAX_Q;   // alvo configurado
-
-// Fallback automático de potência. Depois de falha sustentada de conexão, a peça
-// passa a tentar o OUTRO nível — e fica no que funcionar. Cobre os dois sentidos:
-// placa do lote fraco presa em 19,5 dBm cai para 15 e conecta; placa boa em ponto
-// de sinal ruim, presa em 15, sobe para 19,5 e conecta.
-//
-// É diferente de escolher a potência por um teste no boot, que dá falso positivo
-// em placa marginal: aqui só agimos após minutos de falha real, e o critério é o
-// único que importa — conectou ou não. Nada é gravado na NVS: se a peça reiniciar,
-// volta ao valor configurado.
-bool txPowerFallback = false;
-wifi_power_t activeTxPower() {
-  if (!txPowerFallback) return txPower;
-  return (txPower > (wifi_power_t)TXPOWER_REDUCED_Q) ? (wifi_power_t)TXPOWER_REDUCED_Q
-                                                     : (wifi_power_t)TXPOWER_MAX_Q;
-}
-
-// ---------- Reafirmação da potência ----------
-// Com txPower no máximo (o padrão) isto é inócuo: nada fica ACIMA de 19,5. Passa
-// a valer nas peças configuradas abaixo do máximo — e aí é indispensável, porque
-// aplicar uma vez no boot não basta:
-//
-// 1. Qualquer troca de modo devolve o rádio à potência máxima. A pegadinha é o
-//    softAPdisconnect(true) do apLifetimeTick: por dentro ele faz
-//    AP.end() -> enableAP(false) -> mode(WIFI_STA) — ou seja, uma troca de modo.
-//    Sem reaplicar, a peça volta a 19,5 dBm no minuto 10 de todo boot.
-//
-// 2. setTxPower() é ignorado EM SILÊNCIO se nenhuma interface tiver reportado
-//    START: o guard testa STA.started()/AP.started(), que leem o bit
-//    ESP_NETIF_STARTED_BIT, setado por evento de forma assíncrona. Chamado logo
-//    depois de WiFi.mode(), pode simplesmente não valer.
-//
-// A comparação é ">" e não "!=" de propósito — o rádio pode aplicar um degrau um
-// pouco abaixo do pedido, e isso é aceitável; o que não pode é voltar para cima.
-const uint32_t TXPOWER_CHECK_MS = 5000;
-uint32_t lastTxPowerCheckMs = 0;
-
+// radioStarted(): a interface Wi-Fi ja reportou START? O bit e setado por
+// evento, de forma assincrona, entao logo apos um WiFi.mode() ele ainda pode
+// estar falso. Sobrou como guarda de leitura da potencia no log e na
+// telemetria: getTxPower() devolve 19,5 dBm de fallback quando nada subiu, e
+// sem esta checagem o campo "txp" mentiria em vez de admitir que nao sabe.
 bool radioStarted() { return WiFi.STA.started() || WiFi.AP.started(); }
-
-// getTxPower() devolve 19,5 dBm como fallback quando nada está iniciado, então a
-// checagem de radioStarted() vem antes — sem ela, leríamos um valor inventado.
-bool applyTxPower() {
-  if (!radioStarted()) return false;
-  wifi_power_t alvo = activeTxPower();
-  if (WiFi.getTxPower() <= alvo) return true;
-  WiFi.setTxPower(alvo);
-  return WiFi.getTxPower() <= alvo;
-}
-
-void txPowerTick() {
-  if ((millis() - lastTxPowerCheckMs) < TXPOWER_CHECK_MS) return;
-  lastTxPowerCheckMs = millis();
-  if (!radioStarted()) return;
-  wifi_power_t cur = WiFi.getTxPower();
-  wifi_power_t alvo = activeTxPower();
-  if (cur > alvo) {
-    Serial.printf("TXPOWER: %.1f dBm fora do alvo, reaplicando %.1f dBm\n",
-                  cur / 4.0, alvo / 4.0);
-    WiFi.setTxPower(alvo);
-  }
-}
 
 float readInternalTempC() {
   return temperatureRead();
@@ -335,8 +259,8 @@ WebSocketsClient webSocket;
 Preferences prefs;
 
 // ---------- IO (pinos configuraveis no /admin, persistidos na NVS) ----------
-int startPin = 5;   // pulso START IN (Speed Queen H3-7), ativo HIGH
-int availPin = 6;   // leitura AVAIL OUT (Speed Queen H3-4), INPUT_PULLUP
+int startPin = 42;  // pulso START IN (Speed Queen H3-7), ativo HIGH
+int availPin = 40;  // leitura AVAIL OUT (Speed Queen H3-4), INPUT_PULLUP
 
 // ---------- LED de status ----------
 // O DevKit S3 N16R8 nao tem LED monocromatico de usuario - o unico LED
@@ -896,16 +820,11 @@ void loadPrefs() {
   wifiChannelHint  = prefs.getInt("wifich", 0);
   ledPin           = prefs.getInt("ledPin",  ledPin);
   ledMode          = (uint8_t)constrain(prefs.getInt("ledMode", ledMode), 0, 3);
-  // 0 = chave ausente (nenhum valor valido e 0) -> potencia cheia, o padrao desta
-  // placa. So opera reduzido quem salvou um valor menor pelo /admin.
-  int txq          = prefs.getInt("txpower", 0);
-  txPower          = (wifi_power_t)(txq ? constrain(txq, TXPOWER_MIN_Q, TXPOWER_MAX_Q)
-                                        : TXPOWER_MAX_Q);
   bootCount        = prefs.getUInt("bootCount",   0);
   // Pino invalido gravado (placa trocada, digitacao errada num /save antigo) volta
   // ao padrao em vez de virar peca sem boot.
-  if (!gpioLivre(startPin)) startPin = 5;
-  if (!gpioLivre(availPin)) availPin = 6;
+  if (!gpioLivre(startPin)) startPin = 42;
+  if (!gpioLivre(availPin)) availPin = 40;
   if (!gpioLivre(ledPin))   ledPin   = 48;
 }
 
@@ -948,14 +867,6 @@ void setupAPSTA() {
   WiFi.softAP(apName.c_str(), "12345678", apCh, false);
   delay(200);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
-  // Mesma corrida assíncrona do START bit documentada em applyTxPower(): o
-  // delay(200) acima não garante que a interface já reportou START, e uma
-  // peça já configurada com WiFi salvo nasce mirando potência cheia — este é
-  // o primeiro boot do rádio na sessão inteira, vale a pena esperar direito
-  // em vez de confiar só no delay fixo.
-  uint32_t t0boot = millis();
-  while (!radioStarted() && (millis() - t0boot) < 500) delay(10);
-  applyTxPower();
   // O tx= é leitura real do rádio; -1 quando nenhuma interface subiu ainda (nesse
   // caso getTxPower() devolveria 19,5 de fallback e o log mentiria).
   Serial.printf("AP: %s | IP: %s | ch=%d | tx=%.1fdBm\n", apName.c_str(),
@@ -972,16 +883,6 @@ void connectToWiFi_begin() {
   // ficava com dois rádios ativos pelo resto do boot: mais calor e o
   // apLifetimeTick nunca mais disparava de novo (apEnabled já false).
   WiFi.mode(apEnabled ? WIFI_AP_STA : WIFI_STA);
-  // Trocar de modo reseta a potência para o máximo, e este é o caminho crítico:
-  // um failover faz WiFi.disconnect(true), que derruba o rádio inteiro
-  // (mode(0) -> esp_wifi_stop). Ao voltar, as interfaces levam alguns
-  // milissegundos para reportar START, e sem esse bit o setTxPower é ignorado em
-  // silêncio — a associação sairia em 19,5 dBm, justamente o pico de corrente que
-  // este lote não sustenta. A espera é limitada e só ocorre em tentativa de
-  // conexão, no máximo a cada 5s.
-  uint32_t t0 = millis();
-  while (!radioStarted() && (millis() - t0) < 500) delay(10);
-  applyTxPower();
   WiFi.begin(activeSSID(), activePass());
   wifiConnecting = true;
   wifiConnectStartMs = millis();
@@ -1028,11 +929,6 @@ void startWifiTest(const String& ssid, const String& pass, int ch) {
     WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
     delay(60);
   }
-  // Recriar o softAP em outro canal também mexe no rádio — mesma corrida
-  // assíncrona do START bit de sempre, o delay(60) acima não garante nada.
-  uint32_t t0test = millis();
-  while (!radioStarted() && (millis() - t0test) < 500) delay(10);
-  applyTxPower();
   WiFi.begin(ssid.c_str(), pass.c_str());
   Serial.printf("TEST WiFi: SSID=%s ch=%d\n", ssid.c_str(), ch);
 }
@@ -1608,7 +1504,6 @@ void loop() {
   creditTick();
   watchdogTick();
   apLifetimeTick();
-  txPowerTick();
   evSaveTick();
   wsRestartTick();
   otaTick();
@@ -1652,12 +1547,6 @@ void wifiTick() {
         WiFi.softAPdisconnect(true);
         apEnabled = false;
         lastConnectivityOkMs = millis();
-        // Mesma corrida assíncrona do START bit documentada em applyTxPower():
-        // sem esperar radioStarted(), a reaplicação abaixo podia falhar em
-        // silêncio bem no instante em que o rádio troca de modo.
-        uint32_t t0drop = millis();
-        while (!radioStarted() && (millis() - t0drop) < 500) delay(10);
-        applyTxPower();
       }
       if (wifiFailStreak >= WIFI_FAIL_HARD_RESET && hardResetPermitido()) {
         // disconnect(true) derruba a interface (esp_wifi_stop) e libera os PCBs
@@ -1768,15 +1657,11 @@ void watchdogTick() {
           evAdd(EV_WD_WS, 0);
           fullReconnectWiFiWS();
         } else {
-          Serial.println("WATCHDOG: WS down persistente. Failover + fallback de potencia.");
+          // O degrau seguinte era alternar a potência de TX, remédio do lote ruim
+          // de C3. Nesta placa a alimentação sustenta o pico do TX, então sobrou o
+          // failover de rede — que é o que de fato resolve aqui.
+          Serial.println("WATCHDOG: WS down persistente. Failover de rede.");
           wsDownEscalation = 0;
-          // Alterna a potência: se o problema for a placa não sustentar o TX (ou o
-          // contrário, sinal fraco demais para a potência reduzida), o outro nível
-          // resolve. Não grava na NVS — é tentativa, não configuração.
-          txPowerFallback = !txPowerFallback;
-          Serial.printf("TXPOWER: fallback %s -> alvo %.1f dBm\n",
-                        txPowerFallback ? "ligado" : "desligado",
-                        activeTxPower() / 4.0);
           evAdd(EV_WD_FAIL, (int16_t)wifiSlot);
           failoverReconnect();
         }
@@ -1811,15 +1696,6 @@ void apLifetimeTick() {
 
   Serial.println("AP lifetime expirou. Desligando AP.");
   WiFi.softAPdisconnect(true);
-  // softAPdisconnect(true) é uma troca de modo (AP_STA -> STA) e derruba a
-  // potência de volta para 19,5 dBm. Reaplicar o limite não basta chamar
-  // direto: mesma corrida assíncrona do START bit documentada em
-  // applyTxPower() — sem esperar radioStarted(), a chamada abaixo podia
-  // falhar em silêncio e deixar a peça exposta em potência cheia até o
-  // txPowerTick() periódico corrigir (até 5s depois).
-  uint32_t t0ap = millis();
-  while (!radioStarted() && (millis() - t0ap) < 500) delay(10);
-  applyTxPower();
   apEnabled = false;
   lastConnectivityOkMs = millis();
   if (wifiTestActive) {
@@ -2123,18 +1999,8 @@ select option{background:var(--cd)}
     <div class="step" id="step3">
       <div class="sec">Opções — Industrial</div>
       <div class="chk"><input id="availEn" type="checkbox"><label for="availEn">Fail-safe AVAIL — confirma o ciclo e repulsa se a máquina não ligar</label></div>
-      <label>Potência de transmissão do rádio</label>
-      <select id="txpower">
-        <option value="78">19,5 dBm — máximo (padrão)</option>
-        <option value="68">17 dBm</option>
-        <option value="60">15 dBm — alimentação fraca</option>
-        <option value="52">13 dBm</option>
-        <option value="44">11 dBm</option>
-        <option value="34">8,5 dBm</option>
-      </select>
-      <div class="hint">Esta placa opera em <b>potência cheia</b> por padrão. Só reduza se a peça <b>associar a 15 dBm e falhar a 19,5</b> — sintoma de fonte ou cabo USB que não sustenta o pico do transmissor.</div>
       <div class="hint">Reinício automático após 15min sem WebSocket: <b>sempre ativo</b>.</div>
-      <div class="hint"><b>Modelos sem AVAIL: deixe o fail-safe desmarcado.</b> Os pinos (START IN <b>GPIO5</b> / AVAIL OUT <b>GPIO6</b>) e o LED de status usam os padrões desta placa e só são ajustados no Administrador.</div>
+      <div class="hint"><b>Modelos sem AVAIL: deixe o fail-safe desmarcado.</b> Os pinos (START IN <b>GPIO42</b> / AVAIL OUT <b>GPIO40</b>) e o LED de status usam os padrões desta placa e só são ajustados no Administrador.</div>
     </div>
   </div>
 
@@ -2212,7 +2078,6 @@ function save(){
     '&pass2='+encodeURIComponent(qs('pass2').value)+
     '&nodeid='+encodeURIComponent(qs('nodeid').value.trim())+
     '&availEn='+(qs('availEn').checked?1:0)+
-    '&txpower='+qs('txpower').value+
     '&wizard=1';
   fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b})
     .then(r=>r.text()).then(t=>{msg(t+' Reconecte ao Wi-Fi em ~5s.');})
@@ -2239,8 +2104,6 @@ window.onload=()=>{
     qs('ssid2').value=d.ssid2||''; qs('pass2').value=d.pass2||'';
     qs('nodeid').value=d.nodeid||'';
     qs('availEn').checked=(d.availEn===1);
-    // txpower 0 = nunca configurado: 19,5 e o padrao real desta placa.
-    qs('txpower').value = d.txpower ? String(d.txpower) : '78';
   }).catch(()=>{});
   scan();
   qs('t0').onclick=()=>{net1ok=false;testWifi(qs('manual_ssid').value.trim()||qs('ssid').value,qs('pass').value,'ts0',(ok)=>{net1ok=ok;});};
@@ -2349,17 +2212,6 @@ select option{background:var(--cd)}
   </div>
   <div class="box">
     <div class="sec">Avançado</div>
-    <label>Potência de transmissão do rádio</label>
-    <select id="txpower">
-      <option value="78">19,5 dBm — máximo (padrão)</option>
-      <option value="68">17 dBm</option>
-      <option value="60">15 dBm — alimentação fraca</option>
-      <option value="52">13 dBm</option>
-      <option value="44">11 dBm</option>
-      <option value="34">8,5 dBm</option>
-    </select>
-    <div style="color:var(--mu);font-size:10px;line-height:1.5;margin:8px 0 0">Esta placa opera em <b>19,5 dBm</b> (potência cheia) por padrão — diferente do C3, cujo lote ruim exigia nascer em 15. Só reduza onde a alimentação não sustenta o pico do transmissor: o sintoma é a peça <b>associar a 15 dBm e falhar a 19,5</b>. Reduzir encurta o alcance de subida em ~4,5 dB sem alterar o RSSI, que mede a descida.</div>
-    <button class="btn" id="bAdv">Salvar potência</button>
     <div style="color:var(--mu);font-size:10px;line-height:1.5;margin:10px 0">Auto-restart após 15min sem WebSocket: <b>sempre ativo</b> (não é mais configurável).</div>
     <div class="row"><button class="btn ghost" id="bRst">Reiniciar</button><button class="btn danger" id="bClr">Apagar tudo</button></div>
   </div>
@@ -2376,19 +2228,17 @@ function scan(){fetch('/scan').then(r=>r.json()).then(l=>{['ssid','ssid2'].forEa
 window.onload=()=>{
   fetch('/config-data').then(r=>r.json()).then(d=>{
     qs('nodeid').value=d.nodeid||''; qs('host').value=d.host||''; qs('port').value=d.port||80;
-    qs('startPin').value=d.startPin!=null?d.startPin:5; qs('availPin').value=d.availPin!=null?d.availPin:6;
+    qs('startPin').value=d.startPin!=null?d.startPin:42; qs('availPin').value=d.availPin!=null?d.availPin:40;
     qs('availEn').checked=(d.availEn===1);
     qs('ledPin').value=d.ledPin!=null?d.ledPin:48; qs('ledMode').value=String(d.ledMode!=null?d.ledMode:3);
-    qs('txpower').value = d.txpower ? String(d.txpower) : '78';   // 0 = nunca configurado
   }).catch(()=>{});
   scan();
   qs('bNode').onclick=()=>{if(!val('nodeid')){msg('Preencha o Node ID');return;}save({nodeid:val('nodeid')});};
   qs('bSrv').onclick=()=>{if(!val('host')){msg('Preencha o host');return;}save({host:val('host'),port:val('port')||80});};
   qs('bN1').onclick=()=>{let s=val('m1')||val('ssid');if(!s){msg('Escolha a rede 1');return;}save({ssid:s,pass:qs('p1').value});};
   qs('bN2').onclick=()=>{save({ssid2:(val('m2')||val('ssid2')),pass2:qs('p2').value});};
-  qs('bPin').onclick=()=>{save({startPin:val('startPin')||5,availPin:val('availPin')||6,availEn:(qs('availEn').checked?1:0)});};
+  qs('bPin').onclick=()=>{save({startPin:val('startPin')||42,availPin:val('availPin')||40,availEn:(qs('availEn').checked?1:0)});};
   qs('bLed').onclick=()=>{save({ledPin:val('ledPin')||48,ledMode:qs('ledMode').value});};
-  qs('bAdv').onclick=()=>{save({txpower:qs('txpower').value});};
   qs('bRst').onclick=()=>{if(confirm('Reiniciar o dispositivo?')){msg('Reiniciando…');fetch('/restart');}};
   qs('bClr').onclick=()=>{if(confirm('Apagar TODA a configuração e reiniciar?')){msg('Apagando…');fetch('/resetwifi');}};
 };
@@ -2443,10 +2293,7 @@ void handleConfigData() {
   json += "\"availPin\":"    + String(availPin) + ",";
   json += "\"availEn\":"     + String(availEnabled ? 1 : 0) + ",";
   json += "\"ledPin\":"      + String(ledPin) + ",";
-  json += "\"ledMode\":"     + String(ledMode) + ",";
-  // Valor GRAVADO, não o efetivo: 0 significa "nunca configurado", e é isso que
-  // permite às telas pré-selecionarem 19,5 enquanto a peça roda no fail-safe de 15.
-  json += "\"txpower\":"     + String(prefs.getInt("txpower", 0));
+  json += "\"ledMode\":"     + String(ledMode);
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -2484,9 +2331,6 @@ void handleSave() {
   }
   if (server.hasArg("ledMode")) { ledMode = (uint8_t)constrain(server.arg("ledMode").toInt(), 0, 3); prefs.putInt("ledMode", ledMode); any = true; }
   if (server.hasArg("availEn"))  { availEnabled = server.arg("availEn").toInt() == 1; prefs.putInt("availEn", availEnabled ? 1 : 0); any = true; }
-  // txpower em quartos de dBm (unidade do enum wifi_power_t). O constrain evita
-  // que um valor absurdo vindo da URL desligue o rádio da peça em campo.
-  if (server.hasArg("txpower"))  { int q = constrain(server.arg("txpower").toInt(), TXPOWER_MIN_Q, TXPOWER_MAX_Q); txPower = (wifi_power_t)q; prefs.putInt("txpower", q); any = true; }
   // "wsrestart" saiu de cena: o auto-restart passou a ser incondicional. A chave
   // antiga na NVS é simplesmente ignorada, então peças já configuradas não
   // precisam ser mexidas — inclusive as que tinham o valor salvo como 0.
@@ -2520,8 +2364,8 @@ void handleStatusJson() {
   json += "\"nodeId\":\""     + nodeId + "\",";
   json += "\"ssid\":\""       + (staOk ? WiFi.SSID() : String("")) + "\",";
   json += "\"rssi\":"         + String(staOk ? WiFi.RSSI() : 0) + ",";
-  // Leitura de volta do rádio (não o valor pedido) — é como se confere em campo
-  // se o limite de potência está mesmo valendo. -1 = rádio ainda não iniciado.
+  // Leitura de volta do rádio, informativa: esta placa não expõe ajuste de
+  // potência e opera sempre no máximo. -1 = rádio ainda não iniciado.
   json += "\"txp\":"          + String(radioStarted() ? WiFi.getTxPower() / 4.0 : -1.0, 1) + ",";
   json += "\"ip_sta\":\""     + (staOk ? WiFi.localIP().toString() : String("")) + "\",";
   json += "\"ip_ap\":\""      + WiFi.softAPIP().toString() + "\",";
